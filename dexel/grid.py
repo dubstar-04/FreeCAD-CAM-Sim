@@ -204,7 +204,12 @@ class DexelGrid:
         rmin = min(x for x, _ in polygon)
         rmax = max(x for x, _ in polygon)
         if rmin < -self.tolerance:
-            raise ValueError("Turning insert sweeps across the spindle axis are not supported")
+            if rmax > self.tolerance:
+                raise ValueError("Turning insert sweeps across the spindle axis are not supported")
+            polygon = [(-x, z) for x, z in reversed(polygon)]
+            left = min(range(len(polygon)), key=lambda index: polygon[index])
+            polygon = polygon[left:] + polygon[:left]
+            rmin, rmax = -rmax, -rmin
         if (max(z for _, z in polygon) <= self.zmin + self.tolerance
                 or min(z for _, z in polygon) >= self.zmax - self.tolerance):
             return 0
