@@ -1,5 +1,5 @@
 # FreeCAD Path Simulation
-A FreeCAD CAM Addon to help simulate CNC tool paths.  
+A FreeCAD CAM Addon to help simulate CNC tool paths.
 
 ## Description
 This addon appears under **CAM -> CAM Addons -> Path Simulator Next** in the CAM
@@ -21,12 +21,12 @@ run on a machine.
 
 ## Requirements
 * FreeCAD with the CAM workbench (`CAMWorkbench`); the legacy Path workbench is not supported
-* Python3  
+* Python3
 * Qt5
 
 ## Installation
-1. Use `git clone` or download the `.zip` file of this repo directly in to your [FreeCAD `Mod/` directory](https://www.freecadweb.org/wiki/Installing_more_workbenches).  
-2. Restart FreeCAD 
+1. Use `git clone` or download the `.zip` file of this repo directly in to your [FreeCAD `Mod/` directory](https://www.freecadweb.org/wiki/Installing_more_workbenches).
+2. Restart FreeCAD
 3. Open a document with a CAM job and activate the CAM workbench.
 4. Select **CAM -> CAM Addons -> Path Simulator Next**.
 5. Select the operations and engine in the task panel, then use **Play** in the
@@ -48,6 +48,11 @@ up, the preview slows down instead of jumping ahead through a pass. Timeline
 positions, stock resolution and mesh generation are unchanged. Stock updates and
 seeks include the exact partial move at the current sampled position.
 
+Turning accepts insert sweeps entirely on either spindle side. Negative-X
+far-side sweeps are reflected to positive radius after combining the actual
+insert outline with its motion; the native tool reference is unchanged.
+Sweeps crossing the spindle axis remain unsupported and are rejected.
+
 ## Tests
 Run the headless worker regression checks (no FreeCAD installation required):
 
@@ -55,9 +60,9 @@ Run the headless worker regression checks (no FreeCAD installation required):
 python3 -B -m unittest discover -s tests -v
 ```
 
-## Feedback  
-If you have feedback or need to report bugs please participate on the related [Path Forum](https://forum.freecadweb.org/viewforum.php?f=15). 
+## Feedback
+If you have feedback or need to report bugs please participate on the related [Path Forum](https://forum.freecadweb.org/viewforum.php?f=15).
 
 ## Disclaimer
-This is an experimental tool and must be used at your own risk. Machine tools are dangerous and the author of this tool will not be responsible for any 
+This is an experimental tool and must be used at your own risk. Machine tools are dangerous and the author of this tool will not be responsible for any
 damage or personal injury caused by using incorrect machining parameters.
