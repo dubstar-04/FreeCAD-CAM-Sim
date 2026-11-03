@@ -274,6 +274,41 @@ class SeekTests(unittest.TestCase):
         self.assertEqual(self.sim.takeMesh()[0], tuple(range(18)))
         self.assertEqual({args[0] for args in self.sim.progress.calls}, {0.9})
 
+    def test_far_side_turning_matches_near_side_and_rejects_axis_crossing(self):
+        profiles = (
+            [(0, 0), (2, 0), (2, 2), (0, 2)],
+            [(0, 0), (2, 1), (1, 3)],
+            [(-0.2, 0), (1.5, -0.5), (2, 1), (0, 2)],
+        )
+        moves = (
+            ((9, -12), (9, -8)),
+            ((9, -12), (8, -8)),
+            ((9, -12), (9, -12)),
+            ((12, -10), (10, -10)),
+        )
+        for profile in profiles:
+            axis_moves = (((0, -12), (0, -8)), ((-0.00005, -12), (-0.00005, -8)))
+            for start, end in moves + (axis_moves if min(x for x, _ in profile) == 0 else ()):
+                with self.subTest(profile=profile, start=start, end=end):
+                    near = DexelGrid.cylinder(10, 20, 0.5, origin=(0, 0, -20))
+                    far = DexelGrid.cylinder(10, 20, 0.5, origin=(0, 0, -20))
+                    near_tool = TurningTool(profile)
+                    far_tool = TurningTool([(-x, z) for x, z in profile])
+                    original = list(far_tool.profile)
+                    near_count = near.cut_turning(near_tool, 1, start, end)
+                    far_count = far.cut_turning(
+                        far_tool, 1, (-start[0], start[1]), (-end[0], end[1]))
+                    self.assertEqual(near_count, far_count)
+                    for name in ("lo", "hi", "lo_id", "hi_id", "touch", "multi"):
+                        self.assertEqual(getattr(near, name), getattr(far, name))
+                    self.assertEqual(near.extract(), far.extract())
+                    self.assertEqual(far_tool.profile, original)
+
+        before = far.volume()
+        with self.assertRaisesRegex(ValueError, "across the spindle axis"):
+            far.cut_turning(far_tool, 2, (-4, -12), (4, -8))
+        self.assertEqual(far.volume(), before)
+
     def test_turning_seek_matches_original_geometry_and_face_colours(self):
         class TurningEngine(Engine):
             def setStock(self, stock):
