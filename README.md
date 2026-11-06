@@ -33,6 +33,21 @@ run on a machine.
    viewport timeline to start the simulation or **Pause** to pause it.
    **Jump to end** reconstructs the final stock without playing the remaining moves.
 
+## Move-only playback
+The `move_only_engine` animates milling and turning tool movements against the
+part without displaying simulated stock or removing material. It does not change
+the visibility of the job's original stock object.
+
+Turning playback currently supports straight G0/G1 moves; G2/G3 turning arcs
+are not yet supported.
+
+## Tool setup errors
+Tools are checked when their operation is reached, not before playback starts.
+If an operation has no Tool Controller, its controller has no ToolBit, or the
+tool has empty or invalid geometry, playback stops with a message naming the
+operation and explaining what to fix. Tool geometry rejected by the selected
+engine is reported in the same way. Invalid operations are not skipped.
+
 ## Timeline seeking
 Click the timeline or drag its marker to reconstruct the stock at that position.
 The marker moves immediately; the stock and tool update when reconstruction is
