@@ -26,12 +26,18 @@ import Mesh
 
 
 class Engine:
+	showInitialStock = False
+
 	def __init__(self):
 		pass
 
 	def setTool(self, tool):
 		''' set the tool definition. tool is a freecad shape object'''
 		pass
+
+	def setTurningTool(self, tool):
+		''' accept a turning tool without simulating material removal '''
+		self.setTool(tool)
 
 	def setStock(self, stock):
 		''' set the starting stock definition. stock is a freecad shape object'''

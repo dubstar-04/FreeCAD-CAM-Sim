@@ -39,6 +39,32 @@ from dexel.motion import sample_turning_path, move_duration
 def isTurningOperation(operation):
 	return hasattr(operation, "MinDiameter") and hasattr(operation, "MaxDiameter")
 
+
+class ToolSetupError(RuntimeError):
+	pass
+
+
+def operationToolShape(operation):
+	label = getattr(operation, "Label", operation.Name)
+	controller = getattr(operation, "ToolController", None)
+	if controller is None:
+		raise ToolSetupError(
+			"{}: no Tool Controller assigned. Edit the operation and select a Tool Controller.".format(label))
+	tool = getattr(controller, "Tool", None)
+	if tool is None:
+		raise ToolSetupError(
+			"{}: Tool Controller '{}' has no tool assigned. Edit the controller and select a ToolBit.".format(
+				label, controller.Label))
+	shape = getattr(tool, "Shape", None)
+	if shape is None or shape.isNull():
+		raise ToolSetupError(
+			"{}: tool '{}' has no shape. Recompute or replace the ToolBit.".format(label, tool.Label))
+	if not shape.isValid():
+		raise ToolSetupError(
+			"{}: tool '{}' has invalid geometry. Repair or replace the ToolBit.".format(label, tool.Label))
+	return shape
+
+
 class PathSim (QtCore.QThread):
 
 	updatePos = QtCore.Signal(FreeCAD.Placement)
@@ -47,11 +73,13 @@ class PathSim (QtCore.QThread):
 	progress = QtCore.Signal(float)
 	cleanup = QtCore.Signal()
 	changedOp = QtCore.Signal(object)
+	toolReady = QtCore.Signal(object)
+	failed = QtCore.Signal(str)
 	pathReady = QtCore.Signal(object)
 
 	# Legacy benchmark override: 0 runs unpaced; otherwise use controller speeds.
 	stepDelay = 0.05
-	previewSpeed = 40.0  # mm/s, used with a warning for zero controller speeds
+	previewSpeed = 100.0  # mm/s, used with a warning for zero controller speeds
 	previewSpindleRPM = 1000.0
 	# minimum seconds between meshes sent to the display
 	meshInterval = 0.2
@@ -82,6 +110,7 @@ class PathSim (QtCore.QThread):
 		self.initialised = False
 		self._stock = None
 		self._operation = None
+		self._toolShape = None
 		self._speeds = None
 		self.spindleRPM = 0.0
 		self._speedWarnings = set()
@@ -118,6 +147,7 @@ class PathSim (QtCore.QThread):
 		self._pendingCut = None
 		self.idx = 0
 		self._operation = None
+		self._toolShape = None
 		self._speeds = None
 		self.spindleRPM = 0.0
 		with self._stateLock:
@@ -145,6 +175,11 @@ class PathSim (QtCore.QThread):
 	def run(self):
 		try:
 			self.runSimulation()
+		except ToolSetupError as error:
+			self.stop()
+			self.initialised = False
+			FreeCAD.Console.PrintError("PathSim: Simulation stopped: {}\n".format(error))
+			self.failed.emit(str(error))
 		except Exception:
 			self.stop()
 			self.initialised = False
@@ -191,6 +226,7 @@ class PathSim (QtCore.QThread):
 				self.engine.setStock(self._stock)
 				self.idx = 0
 				self._operation = None
+				self._toolShape = None
 				meshPending = True
 
 			if target is not None and target == self.idx:
@@ -295,20 +331,30 @@ class PathSim (QtCore.QThread):
 		if self._operation is operation:
 			return
 		self.flushPendingCut()
+		shape = operationToolShape(operation)
 		if isTurningOperation(operation):
 			setTool = getattr(self.engine, "setTurningTool", None)
 			if setTool is None:
-				raise RuntimeError("The selected engine does not support turning; select dexel_engine")
+				raise ToolSetupError(
+					"{}: the selected engine does not support turning. Select dexel_engine "
+					"for material removal or move_only_engine for motion playback.".format(
+						getattr(operation, "Label", operation.Name)))
 		else:
 			setTool = self.engine.setTool
-		setTool(operation.ToolController.Tool.Shape)
+		try:
+			setTool(shape)
+		except ValueError as error:
+			raise ToolSetupError("{}: cannot load the tool: {}".format(
+				getattr(operation, "Label", operation.Name), error)) from error
 		setOperation = getattr(self.engine, "setOperation", None)
 		if setOperation is not None:
 			setOperation(self.operationIds[operation.Name])
 		self._operation = operation
+		self._toolShape = shape
 		self._speeds = self.operationSpeeds(operation)
 		if notify:
 			self.changedOp.emit(operation)
+			self.toolReady.emit(shape)
 
 	def operationSpeeds(self, operation):
 		controller = operation.ToolController
@@ -342,6 +388,7 @@ class PathSim (QtCore.QThread):
 			pos, operation = self.pathPoints[max(0, self.idx - 1)]
 			if self._operation is operation:
 				self.changedOp.emit(operation)
+				self.toolReady.emit(self._toolShape)
 			else:
 				self.loadOperation(operation)
 			self.updateToolPosition(pos, rot)
@@ -425,7 +472,7 @@ class PathSim (QtCore.QThread):
 		currentPos = FreeCAD.Vector(0, 0, 0)
 		pos = FreeCAD.Vector(0, 0, 0)
 		centrePos = FreeCAD.Vector()
-		
+
 		for op in self.operations:
 			if isTurningOperation(op):
 				samples, commandEnds = sample_turning_path(
@@ -470,7 +517,7 @@ class PathSim (QtCore.QThread):
 						bX = pos.x - centrePos.x
 						bY = pos.y - centrePos.y
 
-						startAng = math.atan2(aY, aX) 
+						startAng = math.atan2(aY, aX)
 						# endAng = math.atan2(bY, bX)
 						totalAng = math.atan2(aX * bY - aY * bX, aX * bX + aY * bY)
 
@@ -478,8 +525,8 @@ class PathSim (QtCore.QThread):
 							totalAng = math.pi * 2
 
 						if name in ["G2", "G02"]:
-							totalAng = -abs(totalAng)		
-						
+							totalAng = -abs(totalAng)
+
 						if name in ["G3", "G03"]:
 							totalAng = abs(totalAng)
 
@@ -497,7 +544,7 @@ class PathSim (QtCore.QThread):
 							segZ = currentPos.z + stepZ * seg
 							pathPoints.append([FreeCAD.Vector(segX, segY, segZ), op])
 							pathRapid.append(False)
-							
+
 
 						currentPos.x = pos.x
 						currentPos.y = pos.y
@@ -514,7 +561,7 @@ class PathSim (QtCore.QThread):
 
 						'''
 						if distance < self.stepDistance:
-							# update the cutsim 
+							# update the cutsim
 							# dont move the tool
 							self.skippedDistance += distance
 						'''
