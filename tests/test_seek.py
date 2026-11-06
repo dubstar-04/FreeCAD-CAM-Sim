@@ -96,7 +96,8 @@ class SeekTests(unittest.TestCase):
         self.sim.stepDelay = 0
         self.sim.engine = Engine(self.clock)
         self.sim.operationSpeeds = lambda operation: {}
-        controller = SimpleNamespace(Tool=SimpleNamespace(Shape=None))
+        shape = SimpleNamespace(isNull=lambda: False, isValid=lambda: True)
+        controller = SimpleNamespace(Tool=SimpleNamespace(Shape=shape))
         self.operations = [SimpleNamespace(Name=name, ToolController=controller)
                            for name in ("first", "second")]
         self.sim.operationIds = {"first": 1, "second": 2}
@@ -361,6 +362,37 @@ class SeekTests(unittest.TestCase):
         self.assertEqual(actual_mesh, expected_mesh)
         self.assertEqual(actual_ids, expected_ids)
         self.assertEqual(self.sim.engine.grid.volume(), expected_volume)
+
+    def assert_tool_error(self, operation, expected):
+        with self.assertRaises(worker.ToolSetupError) as context:
+            self.sim.loadOperation(operation)
+        self.assertIn(expected, str(context.exception))
+        self.assertIsNone(self.sim._operation)
+
+    def test_missing_tool_setup_reports_operation(self):
+        operation = SimpleNamespace(Name="op", Label="Rough outside", ToolController=None)
+        self.assert_tool_error(operation, "Rough outside: no Tool Controller assigned")
+
+        operation.ToolController = SimpleNamespace(Label="TC1", Tool=None)
+        self.assert_tool_error(operation, "Tool Controller 'TC1' has no tool assigned")
+
+        empty = SimpleNamespace(isNull=lambda: True, isValid=lambda: False)
+        operation.ToolController.Tool = SimpleNamespace(Label="Bit", Shape=empty)
+        self.assert_tool_error(operation, "tool 'Bit' has no shape")
+
+    def test_tool_setup_error_stops_playback_with_message(self):
+        self.operations[1].Label = "Finish"
+        self.operations[1].ToolController = None
+        self.sim.running = True
+        with patch.object(worker, "time", self.clock), \
+                patch.object(worker.FreeCAD, "Console", SimpleNamespace(
+                    PrintError=lambda message: None), create=True):
+            self.sim.run()
+        self.assertEqual(self.sim.engine.positions, list(range(10)))
+        self.assertFalse(self.sim.needsWork())
+        self.assertFalse(self.sim.initialised)
+        self.assertEqual(len(self.sim.failed.calls), 1)
+        self.assertIn("Finish: no Tool Controller assigned", self.sim.failed.calls[0][0])
 
 
 if __name__ == "__main__":
