@@ -80,7 +80,8 @@ class PathSimPanel:
 		self.sim.meshReady.connect(self.onMeshReady)
 		self.sim.progress.connect(self.timeline.setProgress)
 		self.sim.cleanup.connect(self.cleanup)
-		self.sim.changedOp.connect(self.loadTool)
+		self.sim.toolReady.connect(self.loadTool)
+		self.sim.failed.connect(self.onSimulationFailed)
 		self.sim.pathReady.connect(self.onPathReady)
 		self.sim.finished.connect(self.onWorkerFinished)
 
@@ -220,11 +221,14 @@ class PathSimPanel:
 		self.colourWarned = False
 		self.meshesShown = 0
 		self._resetMeshTiming()
+		if not self.sim.setupEngine(self.form.comboEngines.currentText()):
+			return False
 		self.meshView = FreeCAD.ActiveDocument.addObject("Mesh::Feature", "cutshape")
-		job = FreeCAD.ActiveDocument.findObjects("Path::FeaturePython", "Job.*")[0]
-		self.meshView.Mesh = Mesh.Mesh(job.Stock.Shape.tessellate(0.1))
+		if getattr(self.sim.engine, "showInitialStock", True):
+			job = FreeCAD.ActiveDocument.findObjects("Path::FeaturePython", "Job.*")[0]
+			self.meshView.Mesh = Mesh.Mesh(job.Stock.Shape.tessellate(0.1))
 
-		return self.sim.setupEngine(self.form.comboEngines.currentText())
+		return True
 
 	def startWorker(self):
 		self.setSelectionEnabled(False)
@@ -245,12 +249,19 @@ class PathSimPanel:
 		for widget in (self.form.comboJobs, self.form.comboEngines, self.form.listOperations):
 			widget.setEnabled(enabled)
 	
-	def loadTool(self, op):
-		''' load the tool for the operation '''
+	def onSimulationFailed(self, message):
+		if self._closing:
+			return
+		self.timeline.setPlaying(False)
+		self.cleanupTool()
+		QtGui.QMessageBox.warning(self.form, "Path simulation stopped", message)
+
+	def loadTool(self, shape):
+		''' display the validated tool shape supplied by the worker '''
 		if self.tool is None:
 			self.tool = FreeCAD.ActiveDocument.addObject("Part::FeaturePython", "Tool")
 			self.tool.ViewObject.Proxy = 0
-		self.tool.Shape = op.ToolController.Tool.Shape
+		self.tool.Shape = shape
 
 	def simStop(self):
 		self.sim.stop()
