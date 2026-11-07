@@ -205,6 +205,7 @@ class PathSimPanel:
 		if not self.sim.isRunning() and not self.prepareSimulation():
 			return
 		self.sim.skipTo(progress)
+		self.timeline.setProgress(progress)
 		if not self.sim.isRunning():
 			self.startWorker()
 
