@@ -258,6 +258,8 @@ class PathSimPanel:
 
 	def loadTool(self, shape):
 		''' display the validated tool shape supplied by the worker '''
+		if self._closing:
+			return
 		if self.tool is None:
 			self.tool = FreeCAD.ActiveDocument.addObject("Part::FeaturePython", "Tool")
 			self.tool.ViewObject.Proxy = 0
