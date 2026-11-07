@@ -104,6 +104,9 @@ class DexelGrid:
         Points are ``(x, y, z)`` of the tool origin. ``tool_id`` (1-65535) is
         recorded on the surfaces this cut creates; callers can use operation IDs
         instead of tool IDs. Returns the number of columns that changed.
+
+        Z-changing moves combine midpoint-height XY sweeps with exact tool
+        footprints at both endpoints.
         """
         if not 0 < tool_id < 65536:
             raise ValueError("tool_id must be between 1 and 65535")
@@ -119,6 +122,8 @@ class DexelGrid:
         steps = min(steps, 5000)
 
         changed = 0
+        if dz != 0.0:
+            changed += self._cut_piece(tool, tool_id, x0, y0, x0, y0, z0)
         for step in range(steps):
             t0 = step / steps
             t1 = (step + 1) / steps
@@ -128,6 +133,8 @@ class DexelGrid:
                 x0 + dx * t1, y0 + dy * t1,
                 z0 + dz * (t0 + t1) * 0.5,
             )
+        if dz != 0.0:
+            changed += self._cut_piece(tool, tool_id, x1, y1, x1, y1, z1)
         return changed
 
     def _cut_piece(self, tool, tool_id, ax, ay, bx, by, z):
