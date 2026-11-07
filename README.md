@@ -23,6 +23,7 @@ then restart FreeCAD.
 Tools need valid geometry, feeds and spindle speed. Unset rapids use 1,000 mm/min.
 Setup errors stop playback with a message explaining what to fix.
 Turning currently supports straight G0/G1 moves only.
+Simulation stock and tool objects are removed when opening or closing the simulator.
 
 ## Timeline seeking
 Click the timeline or drag its marker to jump to a position. The marker moves

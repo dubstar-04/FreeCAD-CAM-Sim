@@ -368,7 +368,7 @@ class PathSim (QtCore.QThread):
 			speeds[name] = value
 		if invalid:
 			raise ToolSetupError(
-				"{}: Set positive values for {} in Tool Controller '{}'.".format(
+				"{}: Set {} in Tool Controller '{}'.".format(
 					operationLabel, ", ".join(invalid), controllerLabel))
 		self.spindleRPM = speeds["SpindleSpeed"]
 		return speeds

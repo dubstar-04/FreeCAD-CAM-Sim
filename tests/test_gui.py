@@ -35,13 +35,15 @@ class ToolShutdownTests(unittest.TestCase):
         self.panel = gui.PathSimPanel.__new__(gui.PathSimPanel)
         self.panel._closing = False
         self.panel.tool = None
-        self.document = Mock()
+        self.document = Mock(Objects=[])
+        self.panel.document = self.document
         self.document_patch = patch.object(gui.FreeCAD, "ActiveDocument", self.document)
         self.document_patch.start()
         self.addCleanup(self.document_patch.stop)
 
     def test_queued_tool_callback_after_quit_does_not_recreate_tool(self):
-        self.panel.tool = SimpleNamespace(Name="Tool")
+        self.panel.tool = SimpleNamespace(Name="Simulation_Tool", PathSimObject="Tool")
+        self.document.Objects.append(self.panel.tool)
         self.panel.meshView = None
         self.panel.timeline = Mock()
         self.panel.sim = Mock()
@@ -50,7 +52,7 @@ class ToolShutdownTests(unittest.TestCase):
         self.panel.sim.wait.side_effect = lambda: queued.append(
             lambda: self.panel.loadTool(shape))
         self.panel.quit()
-        self.document.removeObject.assert_called_once_with("Tool")
+        self.document.removeObject.assert_called_once_with("Simulation_Tool")
         self.assertIsNone(self.panel.tool)
         for callback in queued:
             callback()
@@ -69,8 +71,10 @@ class ToolShutdownTests(unittest.TestCase):
     def test_open_panel_creates_and_updates_tool(self):
         shape = object()
         self.panel.loadTool(shape)
-        self.document.addObject.assert_called_once_with("Part::FeaturePython", "Tool")
+        self.document.addObject.assert_called_once_with("Part::FeaturePython", "Simulation_Tool")
         self.assertIs(self.panel.tool, self.document.addObject.return_value)
+        self.assertEqual(self.panel.tool.Label, "Simulation-Tool")
+        self.assertEqual(self.panel.tool.PathSimObject, "Tool")
         self.assertEqual(self.panel.tool.ViewObject.Proxy, 0)
         self.assertIs(self.panel.tool.Shape, shape)
         replacement = object()
@@ -98,7 +102,8 @@ class SeekFeedbackTests(unittest.TestCase):
         self.marker_at_start = []
         self.panel.startWorker = Mock(side_effect=lambda: self.marker_at_start.append(
             self.panel.timeline.progress))
-        self.document_patch = patch.object(gui.FreeCAD, "ActiveDocument", Mock())
+        self.panel.document = Mock(Objects=[])
+        self.document_patch = patch.object(gui.FreeCAD, "ActiveDocument", self.panel.document)
         self.document_patch.start()
         self.addCleanup(self.document_patch.stop)
 
@@ -133,6 +138,112 @@ class SeekFeedbackTests(unittest.TestCase):
         self.panel.sim.skipTo.assert_not_called()
         self.panel.startWorker.assert_not_called()
         self.panel.timeline.setProgress.assert_not_called()
+
+
+class Document:
+    def __init__(self):
+        self.Objects = []
+        self.removed = []
+
+    def addObject(self, type_id, name):
+        existing = {obj.Name for obj in self.Objects}
+        base = name
+        suffix = 1
+        while name in existing:
+            name = "{}{:03d}".format(base, suffix)
+            suffix += 1
+        obj = SimpleNamespace(
+            Name=name, Label=name, TypeId=type_id, ViewObject=SimpleNamespace(),
+            addProperty=Mock())
+        self.Objects.append(obj)
+        return obj
+
+    def removeObject(self, name):
+        obj = next(obj for obj in self.Objects if obj.Name == name)
+        self.Objects.remove(obj)
+        self.removed.append(name)
+
+
+class SimulationObjectTests(unittest.TestCase):
+    def setUp(self):
+        self.document = Document()
+        self.document_patch = patch.object(gui.FreeCAD, "ActiveDocument", self.document)
+        self.document_patch.start()
+        self.addCleanup(self.document_patch.stop)
+
+    def add_simulation_objects(self):
+        stock = self.document.addObject("Mesh::Feature", "Simulation_Cutshape")
+        stock.PathSimObject = "Cutshape"
+        tool = self.document.addObject("Part::FeaturePython", "Simulation_Tool")
+        tool.PathSimObject = "Tool"
+        return stock, tool
+
+    def open_panel(self):
+        with patch.object(gui.FreeCADGui, "PySideUic", SimpleNamespace(
+                loadUi=lambda path: Mock()), create=True), \
+                patch.object(gui.FreeCAD, "ParamGet", return_value=Mock(), create=True), \
+                patch.object(gui.PathSim, "PathSim", return_value=Mock(), create=True), \
+                patch.object(gui.PathSimTimelineGui, "timeline", return_value=Mock(), create=True), \
+                patch.object(gui.PathSimPanel, "setupUi"):
+            return gui.PathSimPanel()
+
+    def test_opening_removes_only_identifiable_simulation_objects(self):
+        legacy_stock = self.document.addObject("Mesh::Feature", "cutshape")
+        legacy_tool = self.document.addObject("Part::FeaturePython", "Tool")
+        unrelated = self.document.addObject("Part::Feature", "Simulation_Cutshape")
+        self.add_simulation_objects()
+        self.add_simulation_objects()
+        panel = self.open_panel()
+        self.assertEqual(self.document.Objects, [legacy_stock, legacy_tool, unrelated])
+        self.assertEqual(len(self.document.removed), 4)
+        self.assertIsNone(panel.tool)
+        self.assertIsNone(panel.meshView)
+
+    def test_preparation_creates_named_marked_stock_and_cleans_stale_objects(self):
+        panel = self.open_panel()
+        self.add_simulation_objects()
+        panel.sim.initialised = False
+        panel.sim.engine.showInitialStock = False
+        panel.getOperations = Mock(return_value=[object()])
+        panel.updateTimeline = Mock()
+        self.assertTrue(panel.prepareSimulation())
+        self.assertEqual(self.document.Objects, [panel.meshView])
+        self.assertEqual(panel.meshView.Name, "Simulation_Cutshape")
+        self.assertEqual(panel.meshView.Label, "Simulation-Cutshape")
+        self.assertEqual(panel.meshView.PathSimObject, "Cutshape")
+        panel.meshView.addProperty.assert_called_once_with(
+            "App::PropertyString", "PathSimObject", "PathSim")
+        panel.loadTool(object())
+        self.assertEqual(panel.tool.Name, "Simulation_Tool")
+        self.assertEqual(panel.tool.Label, "Simulation-Tool")
+        self.assertEqual(panel.tool.PathSimObject, "Tool")
+        panel.quit()
+        self.assertEqual(self.document.Objects, [])
+        self.assertIsNone(panel.tool)
+        self.assertIsNone(panel.meshView)
+
+    def test_closing_cleans_original_document_even_if_references_are_missing(self):
+        panel = self.open_panel()
+        self.add_simulation_objects()
+        other_document = Document()
+        other_stock = other_document.addObject("Mesh::Feature", "Simulation_Cutshape")
+        other_stock.PathSimObject = "Cutshape"
+        with patch.object(gui.FreeCAD, "ActiveDocument", other_document):
+            panel.quit()
+        self.assertEqual(self.document.Objects, [])
+        self.assertEqual(other_document.Objects, [other_stock])
+        panel.cleanup()
+        self.assertEqual(len(self.document.removed), 2)
+
+    def test_cleanup_tolerates_objects_already_deleted_from_document(self):
+        panel = self.open_panel()
+        panel.meshView, panel.tool = self.add_simulation_objects()
+        self.document.removeObject(panel.meshView.Name)
+        self.document.removeObject(panel.tool.Name)
+        panel.cleanup()
+        self.assertIsNone(panel.meshView)
+        self.assertIsNone(panel.tool)
+        self.assertEqual(len(self.document.removed), 2)
 
 
 if __name__ == "__main__":

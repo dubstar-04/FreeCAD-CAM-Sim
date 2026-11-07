@@ -60,6 +60,7 @@ class PathSimPanel:
 		self.form = FreeCADGui.PySideUic.loadUi(path_to_ui)
 		self.preferences = FreeCAD.ParamGet("User parameter:BaseApp/Preferences/Mod/PathSim")
 
+		self.document = FreeCAD.ActiveDocument
 		self.tool = None
 		self.sim = PathSim.PathSim()
 		self.jobs = []
@@ -69,6 +70,7 @@ class PathSimPanel:
 		self._resetMeshTiming()
 		self.counter = 0
 		self._closing = False
+		self.cleanup()
 
 		self.timeline = PathSimTimelineGui.timeline()
 
@@ -224,7 +226,10 @@ class PathSimPanel:
 		self._resetMeshTiming()
 		if not self.sim.setupEngine(self.form.comboEngines.currentText()):
 			return False
-		self.meshView = FreeCAD.ActiveDocument.addObject("Mesh::Feature", "cutshape")
+		self.meshView = self.document.addObject("Mesh::Feature", "Simulation_Cutshape")
+		self.meshView.Label = "Simulation-Cutshape"
+		self.meshView.addProperty("App::PropertyString", "PathSimObject", "PathSim")
+		self.meshView.PathSimObject = "Cutshape"
 		if getattr(self.sim.engine, "showInitialStock", True):
 			job = FreeCAD.ActiveDocument.findObjects("Path::FeaturePython", "Job.*")[0]
 			self.meshView.Mesh = Mesh.Mesh(job.Stock.Shape.tessellate(0.1))
@@ -262,7 +267,10 @@ class PathSimPanel:
 		if self._closing:
 			return
 		if self.tool is None:
-			self.tool = FreeCAD.ActiveDocument.addObject("Part::FeaturePython", "Tool")
+			self.tool = self.document.addObject("Part::FeaturePython", "Simulation_Tool")
+			self.tool.Label = "Simulation-Tool"
+			self.tool.addProperty("App::PropertyString", "PathSimObject", "PathSim")
+			self.tool.PathSimObject = "Tool"
 			self.tool.ViewObject.Proxy = 0
 		self.tool.Shape = shape
 
@@ -281,15 +289,18 @@ class PathSimPanel:
 
 	def cleanupTool(self):
 		''' Delete the tool created for the simulation '''
-		if self.tool is not None:
-			FreeCAD.ActiveDocument.removeObject(self.tool.Name)
-			self.tool = None
+		self.cleanupObjects("Tool")
+		self.tool = None
 
 	def cleanupStock(self):
 		''' Delete the stock created for the simulation '''
-		if self.meshView is not None:
-			FreeCAD.ActiveDocument.removeObject(self.meshView.Name)
-			self.meshView = None
+		self.cleanupObjects("Cutshape")
+		self.meshView = None
+
+	def cleanupObjects(self, kind):
+		for obj in list(self.document.Objects):
+			if getattr(obj, "PathSimObject", None) == kind:
+				self.document.removeObject(obj.Name)
 
 	def simComplete(self):
 		''' slot called on simulation completion'''
