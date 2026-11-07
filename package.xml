@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<package format="1">
+  <name>FreeCAD Path Simulation</name>
+  <description>A FreeCAD CAM addon for previewing milling and turning tool paths, with optional material-removal simulation</description>
+  <version>0.1</version>
+  <maintainer email="s.d.wood.82@googlemail.com">Daniel Wood</maintainer>
+  <license file="LICENSE">GPL-2.0</license>
+  <url type="repository" branch="main">https://github.com/dubstar-04/FreeCAD-CAM-Sim</url>
+  <url type="readme">https://github.com/dubstar-04/FreeCAD-CAM-Sim/blob/main/README.md</url>
+
+  <content>
+    <workbench>
+      <icon>Icons/Path_Sim.svg</icon>
+      <freecadmin>1.0.0</freecadmin>
+    </workbench>
+  </content>
+
+</package>

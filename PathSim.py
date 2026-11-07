@@ -24,120 +24,458 @@
 
 import math
 import time
+import threading
 import importlib
+import traceback
 
 from PySide import QtCore, QtGui
 
 import FreeCAD
-import Mesh
 
 import engines
+from dexel.motion import sample_turning_path, move_duration
+
+
+def isTurningOperation(operation):
+	return hasattr(operation, "MinDiameter") and hasattr(operation, "MaxDiameter")
+
+
+class ToolSetupError(RuntimeError):
+	pass
+
+
+def operationToolShape(operation):
+	label = getattr(operation, "Label", operation.Name)
+	controller = getattr(operation, "ToolController", None)
+	if controller is None:
+		raise ToolSetupError(
+			"{}: no Tool Controller assigned. Edit the operation and select a Tool Controller.".format(label))
+	tool = getattr(controller, "Tool", None)
+	if tool is None:
+		raise ToolSetupError(
+			"{}: Tool Controller '{}' has no tool assigned. Edit the controller and select a ToolBit.".format(
+				label, controller.Label))
+	shape = getattr(tool, "Shape", None)
+	if shape is None or shape.isNull():
+		raise ToolSetupError(
+			"{}: tool '{}' has no shape. Recompute or replace the ToolBit.".format(label, tool.Label))
+	if not shape.isValid():
+		raise ToolSetupError(
+			"{}: tool '{}' has invalid geometry. Repair or replace the ToolBit.".format(label, tool.Label))
+	return shape
+
 
 class PathSim (QtCore.QThread):
 
 	updatePos = QtCore.Signal(FreeCAD.Placement)
-	updateMesh = QtCore.Signal(Mesh.Mesh)
+	meshReady = QtCore.Signal()
 	complete = QtCore.Signal()
 	progress = QtCore.Signal(float)
 	cleanup = QtCore.Signal()
 	changedOp = QtCore.Signal(object)
+	toolReady = QtCore.Signal(object)
+	failed = QtCore.Signal(str)
+	pathReady = QtCore.Signal(object)
+
+	# Legacy benchmark override: 0 runs unpaced; otherwise use controller speeds.
+	stepDelay = 0.05
+	# minimum seconds between meshes sent to the display
+	meshInterval = 0.2
+	# minimum seconds between tool position and progress updates sent to the display
+	displayInterval = 1 / 30
 
 	def __init__(self):
 		QtCore.QThread.__init__(self)
 		self.operations = []
+		self.operationIds = {}
+		self.pathPoints = []
+		self.pathRapid = []
+		self.turningCommandEnds = set()
+		self._pendingCut = None
 		self.stepDistance = 2
 		# self.skippedDistance = 0
 		self.running = False
 		self.idx = 0  # index of current position
 		self.engine = None
+		self.meshesPublished = 0
+		self._meshLock = threading.Lock()
+		self._latestMesh = None
+		self._meshSignalled = False
+		self._stateLock = threading.Lock()
+		self._wake = threading.Event()
+		self._seekTarget = None
+		self._seekSerial = 0
+		self.initialised = False
+		self._stock = None
+		self._operation = None
+		self._toolShape = None
+		self._speeds = None
+		self.spindleRPM = 0.0
 
 	def setupEngine(self, engine):
 		# from engines import nativeEngine
 		print("PathSim: Setup Engine:", engine)
 		importstring = "engines.{}".format(engine)
+		self.engine = None
 
 		try:
 			# try to load the selected engine
 			engineModule = importlib.import_module(importstring)
 			eng = engineModule.Engine()
 			self.engine = eng
-		except:
+			return True
+		except Exception as error:
 			self.cleanup.emit()
+			FreeCAD.Console.PrintError("PathSim: Cannot load {}: {}\n".format(importstring, error))
 			msgBox = QtGui.QMessageBox()
 			msgBox.setText("An error occoured while importing {}".format(importstring))
 			msgBox.exec_()
+			return False
 
-	def setOperations(self, operations):
+	def setOperations(self, operations, operationIds=None):
+		self.reset()
 		self.operations = operations
+		self.operationIds = (
+			{op.Name: index + 1 for index, op in enumerate(operations)}
+			if operationIds is None else dict(operationIds))
+
+	def reset(self):
+		self.initialised = False
+		self._pendingCut = None
+		self.idx = 0
+		self._operation = None
+		self._toolShape = None
+		self._speeds = None
+		self.spindleRPM = 0.0
+		with self._stateLock:
+			self.running = False
+			self._seekTarget = None
+
+	def play(self):
+		with self._stateLock:
+			if self.initialised and self.idx >= len(self.pathPoints) and self._seekTarget is None:
+				self._seekTarget = 0
+			self.running = True
+			self._wake.set()
 
 	def stop(self):
-		self.running = False
+		with self._stateLock:
+			self.running = False
+			self._seekTarget = None
+			self._seekSerial += 1
+			self._wake.set()
+
+	def needsWork(self):
+		with self._stateLock:
+			return self.running or self._seekTarget is not None
 
 	def run(self):
+		try:
+			self.runSimulation()
+		except ToolSetupError as error:
+			self.stop()
+			self.initialised = False
+			FreeCAD.Console.PrintError("PathSim: Simulation stopped: {}\n".format(error))
+			self.failed.emit(str(error))
+		except Exception:
+			self.stop()
+			self.initialised = False
+			FreeCAD.Console.PrintError("PathSim: Simulation failed:\n" + traceback.format_exc())
+
+	def runSimulation(self):
 
 		if self.engine is None:
 			print("engine not set")
 			return
 
-		self.idx = 0  # reset the progress to 0
-		self.running = True
-		job = FreeCAD.ActiveDocument.findObjects("Path::FeaturePython", "Job.*")[0]
-		stock = job.Stock
-		self.engine.setStock(stock.Shape)
-		## Expand the path
-		self.pathPoints = self.discretizePath()
+		if not self.initialised:
+			with self._meshLock:
+				self._latestMesh = None
+				self._meshSignalled = False
+				self.meshesPublished = 0
+			job = FreeCAD.ActiveDocument.findObjects("Path::FeaturePython", "Job.*")[0]
+			self._stock = job.Stock.Shape.copy()
+			self._pendingCut = None
+			self.engine.setStock(self._stock)
+			self.pathPoints = self.discretizePath()
+			self.pathReady.emit(self.getOperationRanges())
+			self.initialised = True
+		elif self._operation is not None:
+			self._speeds = self.operationSpeeds(self._operation)
 		rot = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), 0)
-		op = ""
+		meshPending = False
+		lastMesh = time.perf_counter()
+		lastDisplay = 0.0
+		completed = False
+		playbackDeadline = time.perf_counter()
 
-		while self.idx < len(self.pathPoints):
+		while True:
+			iterationStart = time.perf_counter()
+			with self._stateLock:
+				self._wake.clear()
+				target = self._seekTarget
+				seekSerial = self._seekSerial
+				playing = self.running
 
-			if not self.running:
-				print("QUITING THREAD")
-				self.quit()
+			if target is not None and target < self.idx:
+				self._pendingCut = None
+				self.engine.setStock(self._stock)
+				self.idx = 0
+				self._operation = None
+				self._toolShape = None
+				meshPending = True
+
+			if target is not None and target == self.idx:
+				if not self.publishMesh(seekSerial):
+					continue
+				meshPending = False
+				with self._stateLock:
+					if self._seekSerial != seekSerial:
+						continue
+					self._seekTarget = None
+				self.showCurrentPosition(rot)
+				lastMesh = time.perf_counter()
+				playbackDeadline = lastMesh
+				continue
+
+			if not playing and target is None:
+				break
+			if self.idx >= len(self.pathPoints):
+				remaining = playbackDeadline - time.perf_counter()
+				if target is None and playing and remaining > 0:
+					self._wake.wait(remaining)
+					continue
+				with self._stateLock:
+					if self._seekTarget is not None:
+						continue
+					self.running = False
+				completed = playing
 				break
 
 			pntData = self.pathPoints[self.idx]
 			pos = pntData[0]
-			opLabel = pntData[1]
+			operation = pntData[1]
+			if self._operation is not operation:
+				self.loadOperation(operation, notify=target is None)
+				lastDisplay = 0.0
 
-			if op != opLabel:
-				print("Load Tool for op:", opLabel)
-				op = opLabel
-				operation = FreeCAD.ActiveDocument.getObject(op)
-				tool = operation.ToolController.Tool
-				self.engine.setTool(tool.Shape)
-				self.changedOp.emit(operation)
-			
-			self.updateToolPosition(pos, rot)
-			self.engine.processPosition(FreeCAD.Placement(pos, rot))
+			duration = 0.0
+			if target is None and self.stepDelay != 0 and self.idx > 0:
+				previous, previousOperation = self.pathPoints[self.idx - 1]
+				if previousOperation is operation:
+					rapid = self.pathRapid[self.idx]
+					horizontal, vertical = (
+						("HorizRapid", "VertRapid") if rapid else ("HorizFeed", "VertFeed"))
+					duration = move_duration(
+						(previous.x, previous.y, previous.z), (pos.x, pos.y, pos.z),
+						self._speeds[horizontal], self._speeds[vertical],
+						rapid=rapid, turning=isTurningOperation(operation))
 
-			if self.idx % 5 == 0:  # update the next every x iterations
-				mesh = self.engine.getMesh()
-				self.updateMesh.emit(mesh)
-
-			self.progress.emit(self.idx / len(self.pathPoints))
+			placement = FreeCAD.Placement(pos, rot)
+			if (isTurningOperation(operation) and self.turningCommandEnds
+					and getattr(self.engine, "supportsTurningSweeps", False)):
+				self._pendingCut = placement
+				if self.idx + 1 in self.turningCommandEnds:
+					self.flushPendingCut()
+			else:
+				self.engine.processPosition(placement)
 			self.idx += 1
+			meshPending = True
 
-		# emit complete signal
-		self.complete.emit()
-	
+			# Reconstruct all cuts without rendering the path to the seek target.
+			if target is not None:
+				continue
+			with self._stateLock:
+				if self._seekSerial != seekSerial:
+					continue
+
+			if iterationStart - lastDisplay >= self.displayInterval:
+				lastDisplay = iterationStart
+				self.updateToolPosition(pos, rot)
+				self.progress.emit(self.idx / len(self.pathPoints))
+
+			if time.perf_counter() - lastMesh >= self.meshInterval:
+				if self.publishMesh():
+					lastMesh = time.perf_counter()
+					meshPending = False
+
+			if target is None:
+				now = time.perf_counter()
+				# Limit catch-up to one display frame after slow cutting or meshing,
+				# otherwise deferred cuts race through whole passes between updates.
+				playbackDeadline = max(
+					playbackDeadline, now - self.displayInterval) + duration
+				remaining = playbackDeadline - now
+				if remaining >= self.displayInterval:
+					self._wake.wait(remaining)
+
+		if meshPending:
+			self.publishMesh()
+		with self._stateLock:
+			seeking = self._seekTarget is not None
+		if not seeking:
+			self.showCurrentPosition(rot)
+
+		reportPerformance = getattr(self.engine, "reportPerformance", None)
+		if reportPerformance is not None:
+			reportPerformance()
+
+		if completed:
+			self.complete.emit()
+
+	def loadOperation(self, operation, notify=True):
+		if self._operation is operation:
+			return
+		self.flushPendingCut()
+		shape = operationToolShape(operation)
+		if isTurningOperation(operation):
+			setTool = getattr(self.engine, "setTurningTool", None)
+			if setTool is None:
+				raise ToolSetupError(
+					"{}: the selected engine does not support turning. Select dexel_engine "
+					"for material removal or move_only_engine for motion playback.".format(
+						getattr(operation, "Label", operation.Name)))
+		else:
+			setTool = self.engine.setTool
+		try:
+			setTool(shape)
+		except ValueError as error:
+			raise ToolSetupError("{}: cannot load the tool: {}".format(
+				getattr(operation, "Label", operation.Name), error)) from error
+		setOperation = getattr(self.engine, "setOperation", None)
+		if setOperation is not None:
+			setOperation(self.operationIds[operation.Name])
+		self._operation = operation
+		self._toolShape = shape
+		self._speeds = self.operationSpeeds(operation)
+		if notify:
+			self.changedOp.emit(operation)
+			self.toolReady.emit(shape)
+
+	def operationSpeeds(self, operation):
+		controller = operation.ToolController
+		operationLabel = getattr(operation, "Label", operation.Name)
+		controllerLabel = getattr(controller, "Label", operationLabel)
+		speeds = {}
+		invalid = []
+		for name in ("HorizFeed", "VertFeed", "HorizRapid", "VertRapid", "SpindleSpeed"):
+			value = getattr(controller, name, None)
+			value = float(getattr(value, "Value", value)) if value is not None else 0.0
+			if value == 0 and name in ("HorizRapid", "VertRapid"):
+				value = 1000.0 / 60.0
+			if not math.isfinite(value) or value <= 0:
+				invalid.append(name)
+			speeds[name] = value
+		if invalid:
+			raise ToolSetupError(
+				"{}: Set {} in Tool Controller '{}'.".format(
+					operationLabel, ", ".join(invalid), controllerLabel))
+		self.spindleRPM = speeds["SpindleSpeed"]
+		return speeds
+
+	def showCurrentPosition(self, rot):
+		if self.pathPoints:
+			pos, operation = self.pathPoints[max(0, self.idx - 1)]
+			if self._operation is operation:
+				self.changedOp.emit(operation)
+				self.toolReady.emit(self._toolShape)
+			else:
+				self.loadOperation(operation)
+			self.updateToolPosition(pos, rot)
+			self.progress.emit(self.idx / len(self.pathPoints))
+		else:
+			self.progress.emit(0)
+
+	def getOperationRanges(self):
+		''' timeline ranges use the same sampled positions as playback progress '''
+		ranges = []
+		count = len(self.pathPoints)
+		for index, (_, operation) in enumerate(self.pathPoints):
+			operationId = self.operationIds[operation.Name]
+			if ranges and ranges[-1][2] == operationId:
+				ranges[-1][1] = index + 1
+			else:
+				ranges.append([index, index + 1, operationId])
+		return [(start / count, end / count, operationId)
+			for start, end, operationId in ranges]
+
+	def flushPendingCut(self):
+		''' apply deferred straight turning motion before changing tools or showing stock '''
+		if self._pendingCut is not None:
+			self.engine.processPosition(self._pendingCut)
+			self._pendingCut = None
+
+	def publishMesh(self, seekSerial=None):
+		''' make the engine mesh available to the display, with the operation id of each face if
+		the engine tracks it. Only the newest mesh is kept, so a slow display skips meshes
+		instead of building up a backlog. Engines must replace faceOperationIds for each mesh,
+		not modify it, so the list is safe to hand to the gui thread.'''
+		with self._stateLock:
+			if seekSerial is None:
+				if self._seekTarget is not None:
+					return False
+				seekSerial = self._seekSerial
+			elif seekSerial != self._seekSerial:
+				return False
+		self.flushPendingCut()
+		mesh = self.engine.getMesh()
+		frame = (mesh, getattr(self.engine, "faceOperationIds", None))
+		with self._stateLock:
+			if seekSerial != self._seekSerial:
+				return False
+			with self._meshLock:
+				self._latestMesh = frame
+				self.meshesPublished += 1
+				notify = not self._meshSignalled
+				self._meshSignalled = True
+		if notify:
+			self.meshReady.emit()
+		return True
+
+	def takeMesh(self):
+		''' return the newest (mesh, faceOperationIds) not yet displayed, or None '''
+		with self._meshLock:
+			frame = self._latestMesh
+			self._latestMesh = None
+			self._meshSignalled = False
+		return frame
+
 	def skipTo(self, progress):
-		''' skip the the selected point: progress is a percentage where 1 = 100% '''
-		self.idx = int(progress * len(self.pathPoints))
-		# print("PathSim.Jump: new pos", self.idx, "of", len(self.pathPoints))
+		''' request a reconstructed state; only the worker changes the processed index '''
+		if not math.isfinite(progress):
+			raise ValueError("Seek progress must be finite")
+		with self._stateLock:
+			self._seekTarget = int(max(0.0, min(1.0, progress)) * len(self.pathPoints))
+			self._seekSerial += 1
+			with self._meshLock:
+				self._latestMesh = None
+			self._wake.set()
 
 	def updateToolPosition(self, pos, rot):
 		self.updatePos.emit(FreeCAD.Placement(pos, rot))
-		time.sleep(0.05)
 
 	def discretizePath(self):
 		''' split the path in to discrete points'''
 		pathPoints = []
+		pathRapid = []
+		turningCommandEnds = set()
 		currentPos = FreeCAD.Vector(0, 0, 0)
 		pos = FreeCAD.Vector(0, 0, 0)
 		centrePos = FreeCAD.Vector()
-		
+
 		for op in self.operations:
+			if isTurningOperation(op):
+				samples, commandEnds = sample_turning_path(
+					((command.Name, command.Parameters) for command in op.Path.Commands),
+					self.stepDistance, (currentPos.x, currentPos.y, currentPos.z))
+				offset = len(pathPoints)
+				turningCommandEnds.update(offset + end for end in commandEnds)
+				pathPoints.extend([FreeCAD.Vector(*point), op] for point, _ in samples)
+				pathRapid.extend(rapid for _, rapid in samples)
+				if samples:
+					currentPos = FreeCAD.Vector(*samples[-1][0])
+					pos = FreeCAD.Vector(*samples[-1][0])
+				continue
 			for command in op.Path.Commands:
 				name = command.Name
 
@@ -169,7 +507,7 @@ class PathSim (QtCore.QThread):
 						bX = pos.x - centrePos.x
 						bY = pos.y - centrePos.y
 
-						startAng = math.atan2(aY, aX) 
+						startAng = math.atan2(aY, aX)
 						# endAng = math.atan2(bY, bX)
 						totalAng = math.atan2(aX * bY - aY * bX, aX * bX + aY * bY)
 
@@ -177,8 +515,8 @@ class PathSim (QtCore.QThread):
 							totalAng = math.pi * 2
 
 						if name in ["G2", "G02"]:
-							totalAng = -abs(totalAng)		
-						
+							totalAng = -abs(totalAng)
+
 						if name in ["G3", "G03"]:
 							totalAng = abs(totalAng)
 
@@ -194,8 +532,9 @@ class PathSim (QtCore.QThread):
 							segX = centrePos.x + math.cos(angle) * radius
 							segY = centrePos.y + math.sin(angle) * radius
 							segZ = currentPos.z + stepZ * seg
-							pathPoints.append([FreeCAD.Vector(segX, segY, segZ), op.Label])
-							
+							pathPoints.append([FreeCAD.Vector(segX, segY, segZ), op])
+							pathRapid.append(False)
+
 
 						currentPos.x = pos.x
 						currentPos.y = pos.y
@@ -212,7 +551,7 @@ class PathSim (QtCore.QThread):
 
 						'''
 						if distance < self.stepDistance:
-							# update the cutsim 
+							# update the cutsim
 							# dont move the tool
 							self.skippedDistance += distance
 						'''
@@ -229,9 +568,12 @@ class PathSim (QtCore.QThread):
 							for i in range(steps):
 								# print("step ", i, "of", steps, "POS:", pos)
 								pos = currentPos.add(_stepDistance)
-								pathPoints.append([FreeCAD.Vector(pos.x, pos.y, pos.z), op.Label])
+								pathPoints.append([FreeCAD.Vector(pos.x, pos.y, pos.z), op])
+								pathRapid.append(name in ("G0", "G00"))
 								currentPos.x = pos.x
 								currentPos.y = pos.y
 								currentPos.z = pos.z
 								#self.skippedDistance = 0
+		self.pathRapid = pathRapid
+		self.turningCommandEnds = turningCommandEnds
 		return pathPoints
