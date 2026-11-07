@@ -79,8 +79,6 @@ class PathSim (QtCore.QThread):
 
 	# Legacy benchmark override: 0 runs unpaced; otherwise use controller speeds.
 	stepDelay = 0.05
-	previewSpeed = 100.0  # mm/s, used with a warning for zero controller speeds
-	previewSpindleRPM = 1000.0
 	# minimum seconds between meshes sent to the display
 	meshInterval = 0.2
 	# minimum seconds between tool position and progress updates sent to the display
@@ -113,7 +111,6 @@ class PathSim (QtCore.QThread):
 		self._toolShape = None
 		self._speeds = None
 		self.spindleRPM = 0.0
-		self._speedWarnings = set()
 
 	def setupEngine(self, engine):
 		# from engines import nativeEngine
@@ -192,7 +189,6 @@ class PathSim (QtCore.QThread):
 			return
 
 		if not self.initialised:
-			self._speedWarnings.clear()
 			with self._meshLock:
 				self._latestMesh = None
 				self._meshSignalled = False
@@ -358,28 +354,22 @@ class PathSim (QtCore.QThread):
 
 	def operationSpeeds(self, operation):
 		controller = operation.ToolController
-		label = getattr(controller, "Label", operation.Label)
+		operationLabel = getattr(operation, "Label", operation.Name)
+		controllerLabel = getattr(controller, "Label", operationLabel)
 		speeds = {}
-		fallbacks = []
+		invalid = []
 		for name in ("HorizFeed", "VertFeed", "HorizRapid", "VertRapid", "SpindleSpeed"):
 			value = getattr(controller, name, None)
 			value = float(getattr(value, "Value", value)) if value is not None else 0.0
-			if not math.isfinite(value) or value < 0:
-				raise ValueError("{}: {} must be finite and non-negative".format(label, name))
-			if value == 0:
-				value = self.previewSpindleRPM if name == "SpindleSpeed" else self.previewSpeed
-				fallbacks.append("{}={} {}".format(
-					name, value if name == "SpindleSpeed" else value * 60,
-					"RPM" if name == "SpindleSpeed" else "mm/min"))
+			if value == 0 and name in ("HorizRapid", "VertRapid"):
+				value = 1000.0 / 60.0
+			if not math.isfinite(value) or value <= 0:
+				invalid.append(name)
 			speeds[name] = value
-		if fallbacks:
-			key = (getattr(controller, "Name", label), tuple(fallbacks))
-			if key not in self._speedWarnings:
-				self._speedWarnings.add(key)
-				FreeCAD.Console.PrintWarning(
-					"PathSim: {} has zero or missing speeds; preview fallbacks: {}. "
-					"Set the tool controller/SetupSheet speeds for commanded timing.\n".format(
-						label, ", ".join(fallbacks)))
+		if invalid:
+			raise ToolSetupError(
+				"{}: Set positive values for {} in Tool Controller '{}'.".format(
+					operationLabel, ", ".join(invalid), controllerLabel))
 		self.spindleRPM = speeds["SpindleSpeed"]
 		return speeds
 

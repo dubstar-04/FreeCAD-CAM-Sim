@@ -414,6 +414,89 @@ class SeekTests(unittest.TestCase):
         self.assertEqual(len(self.sim.failed.calls), 1)
         self.assertIn("Finish: no Tool Controller assigned", self.sim.failed.calls[0][0])
 
+    def configured_speed_operation(self):
+        return SimpleNamespace(
+            Name="rough", Label="Rough outside", ToolController=SimpleNamespace(
+                Label="TC1", HorizFeed=SimpleNamespace(Value=10), VertFeed=2,
+                HorizRapid=50, VertRapid=25, SpindleSpeed=1200))
+
+    def test_configured_controller_speeds_are_preserved(self):
+        operation = self.configured_speed_operation()
+        self.assertEqual(worker.PathSim.operationSpeeds(self.sim, operation), {
+            "HorizFeed": 10, "VertFeed": 2, "HorizRapid": 50,
+            "VertRapid": 25, "SpindleSpeed": 1200})
+        self.assertEqual(self.sim.spindleRPM, 1200)
+
+    def test_feeds_and_spindle_speed_must_be_configured_and_positive(self):
+        for name in ("HorizFeed", "VertFeed", "SpindleSpeed"):
+            for value in (None, 0, -1, float("nan"), float("inf")):
+                with self.subTest(name=name, value=value):
+                    operation = self.configured_speed_operation()
+                    setattr(operation.ToolController, name, value)
+                    with self.assertRaises(worker.ToolSetupError) as context:
+                        worker.PathSim.operationSpeeds(self.sim, operation)
+                    self.assertIn("TC1", str(context.exception))
+                    self.assertIn(name, str(context.exception))
+                    self.assertIn("Set positive values", str(context.exception))
+            operation = self.configured_speed_operation()
+            delattr(operation.ToolController, name)
+            with self.assertRaisesRegex(worker.ToolSetupError, name):
+                worker.PathSim.operationSpeeds(self.sim, operation)
+
+    def test_unset_rapids_default_to_1000_mm_per_minute(self):
+        for name in ("HorizRapid", "VertRapid"):
+            for value in (None, 0, SimpleNamespace(Value=0)):
+                with self.subTest(name=name, value=value):
+                    operation = self.configured_speed_operation()
+                    setattr(operation.ToolController, name, value)
+                    speeds = worker.PathSim.operationSpeeds(self.sim, operation)
+                    self.assertEqual(speeds[name], 1000 / 60)
+                    self.assertEqual(speeds["HorizFeed"], 10)
+                    self.assertEqual(speeds["VertFeed"], 2)
+                    self.assertEqual(speeds["SpindleSpeed"], 1200)
+            operation = self.configured_speed_operation()
+            delattr(operation.ToolController, name)
+            self.assertEqual(
+                worker.PathSim.operationSpeeds(self.sim, operation)[name], 1000 / 60)
+
+        operation = self.configured_speed_operation()
+        operation.ToolController.HorizRapid = operation.ToolController.VertRapid = 0
+        speeds = worker.PathSim.operationSpeeds(self.sim, operation)
+        for end in ((100, 0, 0), (0, 0, 100), (100, 0, 100)):
+            self.assertEqual(worker.move_duration(
+                (0, 0, 0), end, speeds["HorizRapid"], speeds["VertRapid"], rapid=True), 6)
+
+    def test_invalid_rapids_are_rejected_instead_of_defaulted(self):
+        for name in ("HorizRapid", "VertRapid"):
+            for value in (-1, float("nan"), float("inf")):
+                with self.subTest(name=name, value=value):
+                    operation = self.configured_speed_operation()
+                    setattr(operation.ToolController, name, value)
+                    with self.assertRaisesRegex(worker.ToolSetupError, name):
+                        worker.PathSim.operationSpeeds(self.sim, operation)
+
+    def test_missing_speeds_stop_playback_with_actionable_message(self):
+        del self.sim.operationSpeeds
+        self.operations[0].Label = "Rough outside"
+        controller = self.operations[0].ToolController
+        controller.Label = "TC1"
+        for name in ("HorizFeed", "VertFeed", "HorizRapid", "VertRapid", "SpindleSpeed"):
+            setattr(controller, name, 0)
+        self.sim.running = True
+        with patch.object(worker, "time", self.clock), \
+                patch.object(worker.FreeCAD, "Console", SimpleNamespace(
+                    PrintError=lambda message: None), create=True):
+            self.sim.run()
+        self.assertEqual(self.sim.engine.positions, [])
+        self.assertFalse(self.sim.needsWork())
+        self.assertFalse(self.sim.initialised)
+        self.assertEqual(len(self.sim.failed.calls), 1)
+        message = self.sim.failed.calls[0][0]
+        self.assertEqual(
+            message,
+            "Rough outside: Set positive values for HorizFeed, VertFeed, SpindleSpeed "
+            "in Tool Controller 'TC1'.")
+
 
 if __name__ == "__main__":
     unittest.main()
