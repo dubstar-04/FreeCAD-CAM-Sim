@@ -299,9 +299,9 @@ class PathSim (QtCore.QThread):
 				self.progress.emit(self.idx / len(self.pathPoints))
 
 			if time.perf_counter() - lastMesh >= self.meshInterval:
-				self.publishMesh()
-				lastMesh = time.perf_counter()
-				meshPending = False
+				if self.publishMesh():
+					lastMesh = time.perf_counter()
+					meshPending = False
 
 			if target is None:
 				now = time.perf_counter()

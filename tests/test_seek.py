@@ -181,6 +181,26 @@ class SeekTests(unittest.TestCase):
         self.assertGreater(len(self.sim.progress.calls), 1)
         self.assertEqual(len(self.sim.complete.calls), 1)
 
+    def test_pause_during_periodic_meshing_retries_paused_stock(self):
+        def pause():
+            if len(self.sim.engine.meshes) == 2:
+                self.sim.engine.on_mesh = None
+                self.sim.stop()
+
+        self.sim.meshInterval = 0
+        self.sim.engine.on_mesh = pause
+        self.sim.running = True
+        self.run_worker()
+        self.assertEqual(self.sim.idx, 2)
+        self.assertEqual(self.sim.engine.positions, [0, 1])
+        self.assertEqual(self.sim.engine.meshes, [(0,), (0, 1), (0, 1)])
+        self.assertEqual(self.sim.meshesPublished, 2)
+        self.assertEqual(self.sim.takeMesh()[0], (0, 1))
+        self.assertEqual(self.sim.updatePos.calls[-1][0].Base.x, 1)
+        self.assertEqual(self.sim.progress.calls[-1], (0.1,))
+        self.assertFalse(self.sim.needsWork())
+        self.assertEqual(self.sim.complete.calls, [])
+
     def configure_paced_turning(self):
         """Set up two long straight passes with deferred cuts and a fake wait."""
         self.clock.now = 1
