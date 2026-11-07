@@ -22,7 +22,8 @@ def sample_turning_path(commands, step_distance, initial=(0.0, 0.0, 0.0)):
     """Return motion samples and the exclusive sample index of each command end.
 
     Command boundaries allow straight sweeps to be batched without skipping
-    corners. The first move remains a single tool-locating sample.
+    corners. G0/G1 commands without X, Y or Z are skipped; the first coordinate
+    move remains a single tool-locating sample.
     """
     if not math.isfinite(step_distance) or step_distance <= 0:
         raise ValueError("step_distance must be finite and positive")
@@ -45,6 +46,8 @@ def sample_turning_path(commands, step_distance, initial=(0.0, 0.0, 0.0)):
         if name not in ("G0", "G00", "G1", "G01"):
             if name.startswith("G"):
                 raise ValueError("Turning motion {} is not supported yet".format(name))
+            continue
+        if not any(axis in params for axis in ("X", "Y", "Z")):
             continue
         end = list(position)
         for index, axis in enumerate(("X", "Y", "Z")):
