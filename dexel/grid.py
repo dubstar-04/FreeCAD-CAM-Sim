@@ -4,11 +4,11 @@ Each (x, y) column holds ordered ``[lo, hi]`` material intervals. The common
 case, a single interval, lives in flat typed arrays. Columns with several
 intervals (for example after a tool passes through the middle of the material)
 are kept in a sparse dictionary. Every interval end remembers the id of the
-tool that created it, which is what allows surfaces to be coloured by tool.
+operation that created it. Removed Z ranges retain their operation ids so
+side walls keep their original colours when a later cut changes the column.
 
 Limitations of this first version: only Z rays, so vertical walls are as
-accurate as the grid spacing, and tool ids on walls are approximated with the
-last tool that touched the neighbouring column.
+accurate as the grid spacing.
 """
 
 import math
@@ -58,6 +58,7 @@ class DexelGrid:
         self.hi_id = array('H', [0]) * count
         self.touch = array('H', [0]) * count
         self.multi = {}
+        self.removed = {}
 
         self._rows = [None] * self.ny
         self._dirty = set(range(self.ny))
@@ -289,22 +290,28 @@ class DexelGrid:
             self.lo_id[c] = tool_id
         else:
             self.hi[c] = low
+        self._record_removed(c, [(max(low, bottom) if bottom - low > tol else low,
+                                 min(high, top) if high - top > tol else high)], tool_id)
         return True
 
     def _cut_multi(self, c, bottom, top, tool_id):
         tol = self.tolerance
         changed = False
         result = []
+        removed = []
         for low, high, low_id, high_id in self.multi[c]:
             if high - bottom <= tol or top - low <= tol:
                 result.append([low, high, low_id, high_id])
                 continue
             changed = True
+            removed.append((bottom if bottom - low > tol else low,
+                            top if high - top > tol else high))
             if bottom - low > tol:
                 result.append([low, bottom, low_id, tool_id])
             if high - top > tol:
                 result.append([top, high, tool_id, high_id])
         if changed:
+            self._record_removed(c, removed, tool_id)
             if len(result) >= 2:
                 self.multi[c] = result
             else:
@@ -316,6 +323,39 @@ class DexelGrid:
                 else:
                     self.hi[c] = self.lo[c]
         return changed
+
+    def _record_removed(self, c, intervals, tool_id):
+        """Remember only newly removed material, never overwrite earlier cuts."""
+        spans = self.removed.get(c, []) + [(low, high, tool_id) for low, high in intervals]
+        spans.sort()
+        merged = []
+        for low, high, owner in spans:
+            if (merged and merged[-1][2] == owner
+                    and low - merged[-1][1] <= self.tolerance):
+                merged[-1] = (merged[-1][0], high, owner)
+            else:
+                merged.append((low, high, owner))
+        self.removed[c] = merged
+
+    def _wall_owners(self, c, low, high):
+        """Split an exposed wall by the cuts that removed its neighbour."""
+        tol = self.tolerance
+        current = low
+        for start, end, owner in self.removed.get(c, ()):
+            if min(end, high) - max(current, start) <= tol:
+                continue
+            if start >= high - tol:
+                break
+            if start - current > tol:
+                yield current, min(start, high), 0
+                current = start
+            stop = high if high - end <= tol else end
+            yield current, stop, owner
+            current = stop
+            if current >= high:
+                return
+        if current < high:
+            yield current, high, 0
 
     # ------------------------------------------------------------------ queries
 
@@ -395,7 +435,7 @@ class DexelGrid:
         y0 = self.ymin + j * dy
         y1 = y0 + dy
         lo, hi = self.lo, self.hi
-        lo_id, hi_id, touch = self.lo_id, self.hi_id, self.touch
+        lo_id, hi_id = self.lo_id, self.hi_id
         multi = self.multi
         base = j * nx
         tris = []
@@ -489,13 +529,13 @@ class DexelGrid:
             second = self._intervals(b) if b >= 0 else ()
             xw = xmin + (i + 1) * dx
             if first:
-                owner = touch[b] if b >= 0 else 0
                 for z0, z1 in exposed(first, second):
-                    wall_x(xw, z0, z1, True, owner)
+                    for low, high, owner in self._wall_owners(b, z0, z1):
+                        wall_x(xw, low, high, True, owner)
             if second:
-                owner = touch[a] if a >= 0 else 0
                 for z0, z1 in exposed(second, first):
-                    wall_x(xw, z0, z1, False, owner)
+                    for low, high, owner in self._wall_owners(a, z0, z1):
+                        wall_x(xw, low, high, False, owner)
 
         # Walls facing Y: the outer edge for the first row, then to the next row.
         if j == 0:
@@ -512,12 +552,12 @@ class DexelGrid:
             first = self._intervals(a)
             second = self._intervals(b) if b >= 0 else ()
             if first:
-                owner = touch[b] if b >= 0 else 0
                 for z0, z1 in exposed(first, second):
-                    wall_y(y1, i, z0, z1, True, owner)
+                    for low, high, owner in self._wall_owners(b, z0, z1):
+                        wall_y(y1, i, low, high, True, owner)
             if second:
-                owner = touch[a]
                 for z0, z1 in exposed(second, first):
-                    wall_y(y1, i, z0, z1, False, owner)
+                    for low, high, owner in self._wall_owners(a, z0, z1):
+                        wall_y(y1, i, low, high, False, owner)
 
         return tris, ids
