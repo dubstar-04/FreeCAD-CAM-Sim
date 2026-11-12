@@ -93,11 +93,16 @@ class PathSim (QtCore.QThread):
 		self.turningCommandEnds = set()
 		self._pendingCut = None
 		self._motionFraction = 0.0
+		self._cutFraction = 0.0  # committed cut may lag the displayed motion fraction
+		self._stepRequests = 0
+		self._stepBackRequests = 0
 		self.stepDistance = 2
 		# self.skippedDistance = 0
 		self.running = False
 		self.idx = 0  # index of current position
 		self.engine = None
+		self.showStock = True
+		self._meshRequested = False
 		self.meshesPublished = 0
 		self._meshLock = threading.Lock()
 		self._latestMesh = None
@@ -130,7 +135,7 @@ class PathSim (QtCore.QThread):
 			self.cleanup.emit()
 			FreeCAD.Console.PrintError("PathSim: Cannot load {}: {}\n".format(importstring, error))
 			msgBox = QtGui.QMessageBox()
-			msgBox.setText("An error occoured while importing {}".format(importstring))
+			msgBox.setText("Cannot load {}: {}".format(engine, error))
 			msgBox.exec_()
 			return False
 
@@ -145,6 +150,7 @@ class PathSim (QtCore.QThread):
 		self.initialised = False
 		self._pendingCut = None
 		self._motionFraction = 0.0
+		self._cutFraction = 0.0
 		self.idx = 0
 		self._operation = None
 		self._toolShape = None
@@ -153,6 +159,9 @@ class PathSim (QtCore.QThread):
 		with self._stateLock:
 			self.running = False
 			self._seekTarget = None
+			self._stepRequests = 0
+			self._stepBackRequests = 0
+			self._meshRequested = False
 
 	def play(self):
 		with self._stateLock:
@@ -165,12 +174,25 @@ class PathSim (QtCore.QThread):
 		with self._stateLock:
 			self.running = False
 			self._seekTarget = None
+			self._stepRequests = 0
+			self._stepBackRequests = 0
 			self._seekSerial += 1
 			self._wake.set()
 
 	def needsWork(self):
 		with self._stateLock:
-			return self.running or self._seekTarget is not None
+			return (self.running or self._seekTarget is not None
+				or self._stepRequests > 0 or self._stepBackRequests > 0
+				or self._meshRequested)
+
+	def setShowStock(self, show):
+		''' building stock meshes is skipped while the stock is hidden; material removal
+		continues so the stock is up to date when shown again '''
+		with self._stateLock:
+			self.showStock = show
+			if show and self.initialised:
+				self._meshRequested = True
+				self._wake.set()
 
 	def run(self):
 		try:
@@ -200,6 +222,7 @@ class PathSim (QtCore.QThread):
 			job = FreeCAD.ActiveDocument.findObjects("Path::FeaturePython", "Job.*")[0]
 			self._stock = job.Stock.Shape.copy()
 			self._pendingCut = None
+			self._cutFraction = 0.0
 			self.engine.setStock(self._stock)
 			self.pathPoints = self.discretizePath()
 			self.pathReady.emit(self.getOperationRanges())
@@ -211,6 +234,7 @@ class PathSim (QtCore.QThread):
 		lastMesh = time.perf_counter()
 		self._lastDisplay = -math.inf
 		completed = False
+		moved = False
 
 		while True:
 			with self._stateLock:
@@ -218,19 +242,42 @@ class PathSim (QtCore.QThread):
 				target = self._seekTarget
 				seekSerial = self._seekSerial
 				playing = self.running
+				meshRequested = self._meshRequested
+				self._meshRequested = False
+				if target is None and self._stepRequests:
+					self._stepRequests -= 1
+					target = self._distanceTarget(1.0)
+					self._seekTarget = target
+				elif target is None and self._stepBackRequests:
+					self._stepBackRequests -= 1
+					target = self._distanceTargetBackward(1.0)
+					self._seekTarget = target
 
-			if target is not None:
-				self._motionFraction = 0.0
+			if meshRequested and target is None and self.publishMesh(seekSerial):
+				meshPending = False
+				lastMesh = time.perf_counter()
 
-			if target is not None and target < self.idx:
+			if target is not None and target < self.idx + self._cutFraction:
 				self._pendingCut = None
 				self.engine.setStock(self._stock)
 				self.idx = 0
+				self._motionFraction = 0.0
+				self._cutFraction = 0.0
 				self._operation = None
 				self._toolShape = None
 				meshPending = True
 
-			if target is not None and target == self.idx:
+			if target is not None and int(target) == self.idx:
+				fraction = target - self.idx
+				if fraction > self._cutFraction:
+					self.flushPendingCut()
+					start = self.pathPoints[self.idx - 1][0]
+					end = self.pathPoints[self.idx][0]
+					self._motionFraction = fraction
+					self.engine.processPosition(FreeCAD.Placement(
+						self.interpolatedPosition(start, end), rot))
+					self._cutFraction = fraction
+				self._motionFraction = fraction
 				if not self.publishMesh(seekSerial):
 					continue
 				meshPending = False
@@ -242,8 +289,12 @@ class PathSim (QtCore.QThread):
 				lastMesh = time.perf_counter()
 				continue
 
+			if target is not None:
+				self._motionFraction = 0.0
+
 			if not playing and target is None:
 				break
+			moved = True
 			if self.idx >= len(self.pathPoints):
 				with self._stateLock:
 					if self._seekTarget is not None:
@@ -287,6 +338,7 @@ class PathSim (QtCore.QThread):
 				self.engine.processPosition(placement)
 			self.idx += 1
 			self._motionFraction = 0.0
+			self._cutFraction = 0.0
 			meshPending = True
 
 			# Reconstruct all cuts without rendering the path to the seek target.
@@ -307,7 +359,7 @@ class PathSim (QtCore.QThread):
 			self.publishMesh()
 		with self._stateLock:
 			seeking = self._seekTarget is not None
-		if not seeking:
+		if moved and not seeking:
 			self.showCurrentPosition(rot)
 
 		reportPerformance = getattr(self.engine, "reportPerformance", None)
@@ -321,12 +373,12 @@ class PathSim (QtCore.QThread):
 		'''Display a paced move without cutting beyond the displayed position.'''
 		startTime = time.perf_counter() - self._motionFraction * duration
 		while True:
-			now = time.perf_counter()
-			self._motionFraction = min(1.0, max(0.0, (now - startTime) / duration))
 			with self._stateLock:
 				if not self.running or self._seekSerial != seekSerial:
 					return False
 				self._wake.clear()
+				now = time.perf_counter()
+				self._motionFraction = min(1.0, max(0.0, (now - startTime) / duration))
 			if self._motionFraction >= 1.0:
 				return True
 			self.showPlaybackPosition(
@@ -362,7 +414,7 @@ class PathSim (QtCore.QThread):
 			if setTool is None:
 				raise ToolSetupError(
 					"{}: the selected engine does not support turning. Select dexel_engine "
-					"for material removal or move_only_engine for motion playback.".format(
+					"or turning_profile_engine.".format(
 						getattr(operation, "Label", operation.Name)))
 		else:
 			setTool = self.engine.setTool
@@ -451,6 +503,8 @@ class PathSim (QtCore.QThread):
 			elif seekSerial != self._seekSerial:
 				return False
 		self.flushPendingCut()
+		if not self.showStock:
+			return True
 		mesh = self.engine.getMesh()
 		frame = (mesh, getattr(self.engine, "faceOperationIds", None))
 		with self._stateLock:
@@ -483,12 +537,90 @@ class PathSim (QtCore.QThread):
 			raise ValueError("Seek progress must be finite")
 		with self._stateLock:
 			self._seekTarget = int(max(0.0, min(1.0, progress)) * len(self.pathPoints))
+			self._stepRequests = 0
+			self._stepBackRequests = 0
 			self._seekSerial += 1
 			with self._meshLock:
 				if self._latestMesh is not None:
 					self._publishedMesh = None
 				self._latestMesh = None
 			self._wake.set()
+
+	def stepForward(self):
+		''' pause and queue one 1 mm advance along the sampled toolpath '''
+		with self._stateLock:
+			self.running = False
+			self._stepBackRequests = 0
+			self._stepRequests += 1
+			self._seekSerial += 1
+			with self._meshLock:
+				if self._latestMesh is not None:
+					self._publishedMesh = None
+				self._latestMesh = None
+			self._wake.set()
+
+	def stepBackward(self):
+		''' pause and queue one 1 mm reverse advance along the sampled toolpath '''
+		with self._stateLock:
+			self.running = False
+			self._stepRequests = 0
+			self._stepBackRequests += 1
+			self._seekSerial += 1
+			with self._meshLock:
+				if self._latestMesh is not None:
+					self._publishedMesh = None
+				self._latestMesh = None
+			self._wake.set()
+
+	def _distanceTarget(self, distance):
+		''' return a fractional sample index after travelling distance along the path '''
+		count = len(self.pathPoints)
+		if not count:
+			return 0
+		position = min(float(count), max(1.0, self.idx + self._motionFraction))
+		while position < count:
+			index = int(position)
+			fraction = position - index
+			start, startOperation = self.pathPoints[index - 1]
+			end, endOperation = self.pathPoints[index]
+			if startOperation is not endOperation:
+				# Playback locates the new tool without traversing the gap.
+				position = float(index + 1)
+				continue
+			length = math.dist((start.x, start.y, start.z), (end.x, end.y, end.z))
+			remaining = length * (1.0 - fraction)
+			if remaining > distance + 1e-12:
+				return position + distance / length
+			distance -= remaining
+			position = float(index + 1)
+			if distance <= 1e-12:
+				break
+		return position
+
+	def _distanceTargetBackward(self, distance):
+		''' return a fractional sample index after travelling backwards along the path '''
+		count = len(self.pathPoints)
+		if not count:
+			return 0
+		position = min(float(count), max(1.0, self.idx + self._motionFraction))
+		while position > 1.0:
+			index = math.ceil(position) - 1
+			fraction = position - index
+			start, startOperation = self.pathPoints[index - 1]
+			end, endOperation = self.pathPoints[index]
+			if startOperation is not endOperation:
+				# Playback locates the new tool without traversing the gap.
+				position = float(index)
+				continue
+			length = math.dist((start.x, start.y, start.z), (end.x, end.y, end.z))
+			remaining = length * fraction
+			if remaining > distance + 1e-12:
+				return position - distance / length
+			distance -= remaining
+			position = float(index)
+			if distance <= 1e-12:
+				break
+		return position
 
 	def updateToolPosition(self, pos, rot):
 		self.updatePos.emit(FreeCAD.Placement(pos, rot))

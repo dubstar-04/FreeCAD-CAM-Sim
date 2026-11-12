@@ -89,6 +89,23 @@ class MeshCacheTests(unittest.TestCase):
         self.assertIsNot(engine.getMesh(), initial)
         self.assertEqual(adapter.Mesh.Mesh.call_count, 2)
 
+    def test_surface_cache_preserves_triangles_and_owners_without_mesh_build(self):
+        engine = self.engine
+        first = engine.getSurface()
+        self.assertIs(engine.getSurface(), first)
+        self.assertEqual(adapter.Mesh.Mesh.call_count, 0)
+        engine.processPosition(placement(0, 0, 10))
+        self.assertIs(engine.getSurface(), first)
+        engine.processPosition(placement(0, 0, 4))
+        second = engine.getSurface()
+        self.assertIsNot(second, first)
+        self.assertEqual(second, engine.grid.extract())
+        self.assertIn(1, second[1])
+        self.assertIs(engine.getSurface(), second)
+        self.assertEqual(adapter.Mesh.Mesh.call_count, 0)
+        engine.getMesh()
+        self.assertEqual(adapter.Mesh.Mesh.call_args.args[0], second[0])
+
     def test_failed_mesh_build_retries_without_publishing_new_face_ids(self):
         engine = self.engine
         initial = engine.getMesh()

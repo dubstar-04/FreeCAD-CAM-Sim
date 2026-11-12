@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 
 def load_panel():
@@ -28,6 +28,53 @@ def load_panel():
 
 
 gui = load_panel()
+
+
+def load_timeline():
+    path = Path(__file__).resolve().parents[1] / "PathSimTimelineGui.py"
+    spec = importlib.util.spec_from_file_location("test_sim_timeline", path)
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(sys.modules, {
+        "PySide": SimpleNamespace(
+            QtGui=SimpleNamespace(QGraphicsObject=object),
+            QtCore=SimpleNamespace(QObject=object, Signal=Mock())),
+        "FreeCADGui": SimpleNamespace(getMainWindow=Mock()),
+    }):
+        spec.loader.exec_module(module)
+    return module
+
+
+class OperationSkipTests(unittest.TestCase):
+    def setUp(self):
+        timeline_class = load_timeline().timeline
+        self.timeline = timeline_class.__new__(timeline_class)
+        self.timeline.progressBarWidth = 100
+        self.timeline.setProgress = Mock()
+        self.timeline.skipRequested = Mock()
+        self.timeline.operationRanges = [(0, 0.3, None), (0.3, 0.6, None),
+                                         (0.6, 1, None)]
+
+    def test_forward_skip_from_last_operation_reaches_end(self):
+        for ranges in (self.timeline.operationRanges, [(0, 1, None)]):
+            for progress in (ranges[-1][0], 0.9, 1.0):
+                with self.subTest(ranges=ranges, progress=progress):
+                    self.timeline.operationRanges = ranges
+                    self.timeline.progress = progress
+                    self.timeline.setProgress.reset_mock()
+                    self.timeline.skipRequested.reset_mock()
+                    self.timeline.jumpToNextOperation()
+                    self.timeline.setProgress.assert_called_once_with(1.0)
+                    self.timeline.skipRequested.emit.assert_called_once_with(1.0)
+
+    def test_forward_skip_still_reaches_next_operation_start(self):
+        self.timeline.progress = 0.1
+        self.timeline.jumpToNextOperation()
+        self.timeline.skipRequested.emit.assert_called_once_with(0.3)
+
+    def test_forward_skip_without_operations_does_not_seek(self):
+        self.timeline.operationRanges = []
+        self.timeline.jumpToNextOperation()
+        self.timeline.skipRequested.emit.assert_not_called()
 
 
 class ToolShutdownTests(unittest.TestCase):
@@ -98,14 +145,17 @@ class SeekFeedbackTests(unittest.TestCase):
         self.panel.sim = Mock(initialised=False)
         self.panel.sim.isRunning.return_value = False
         self.panel.sim.setupEngine.return_value = True
-        self.panel.sim.engine.showInitialStock = False
         self.marker_at_start = []
         self.panel.startWorker = Mock(side_effect=lambda: self.marker_at_start.append(
             self.panel.timeline.progress))
         self.panel.document = Mock(Objects=[])
+        self.panel.document.findObjects.return_value = [Mock()]
         self.document_patch = patch.object(gui.FreeCAD, "ActiveDocument", self.panel.document)
         self.document_patch.start()
         self.addCleanup(self.document_patch.stop)
+        mesh_patch = patch.object(gui.Mesh, "Mesh", Mock(), create=True)
+        mesh_patch.start()
+        self.addCleanup(mesh_patch.stop)
 
     def assert_first_seek_feedback(self, progress):
         self.panel.timeline.progress = progress
@@ -139,6 +189,87 @@ class SeekFeedbackTests(unittest.TestCase):
         self.panel.startWorker.assert_not_called()
         self.panel.timeline.setProgress.assert_not_called()
 
+    def test_step_prepares_simulation_and_pauses_playback(self):
+        self.panel.prepareSimulation = Mock(return_value=True)
+        self.panel.simStepForward()
+        self.panel.sim.stepForward.assert_called_once_with()
+        self.panel.timeline.setPlaying.assert_called_once_with(False)
+        self.panel.startWorker.assert_called_once_with()
+
+    def test_step_during_playback_uses_existing_worker(self):
+        self.panel.sim.isRunning.return_value = True
+        self.panel.simStepForward()
+        self.panel.sim.stepForward.assert_called_once_with()
+        self.panel.timeline.setPlaying.assert_called_once_with(False)
+        self.panel.startWorker.assert_not_called()
+
+    def test_step_backward_prepares_simulation_and_pauses_playback(self):
+        self.panel.prepareSimulation = Mock(return_value=True)
+        self.panel.simStepBackward()
+        self.panel.sim.stepBackward.assert_called_once_with()
+        self.panel.timeline.setPlaying.assert_called_once_with(False)
+        self.panel.startWorker.assert_called_once_with()
+
+    def test_step_backward_during_playback_uses_existing_worker(self):
+        self.panel.sim.isRunning.return_value = True
+        self.panel.simStepBackward()
+        self.panel.sim.stepBackward.assert_called_once_with()
+        self.panel.timeline.setPlaying.assert_called_once_with(False)
+        self.panel.startWorker.assert_not_called()
+
+    def test_turning_only_engine_rejects_mixed_operations_before_display(self):
+        self.panel.operations[0].Label = "Pocket"
+        self.panel.sim.engine.turningOnly = True
+        with patch.object(gui.PathSim, "isTurningOperation", return_value=False, create=True), \
+             patch.object(gui.FreeCAD, "Console", SimpleNamespace(PrintError=Mock()), create=True), \
+             patch.object(gui.QtGui, "QMessageBox", create=True) as message:
+            self.assertFalse(self.panel.prepareSimulation())
+        message.warning.assert_called_once()
+        self.assertIn("Pocket", message.warning.call_args.args[2])
+        self.panel.document.addObject.assert_not_called()
+
+    def test_unavailable_saved_engine_falls_back_to_available_choice(self):
+        self.panel.document.findObjects.return_value = []
+        self.panel.preferences = Mock()
+        self.panel.preferences.GetString.return_value = "removed_engine"
+        self.panel.form.comboEngines.findText.return_value = -1
+        self.panel.form.comboEngines.currentText.return_value = "dexel_engine"
+        console = SimpleNamespace(PrintWarning=Mock())
+        with patch.object(gui.os, "listdir", return_value=[
+                "dexel_engine.py", "turning_profile_engine.py"]), \
+             patch.object(gui.FreeCAD, "Console", console, create=True):
+            self.panel.setupUi()
+        self.assertEqual(self.panel.form.comboEngines.addItem.call_args_list,
+                         [call("dexel_engine"), call("turning_profile_engine")])
+        self.panel.form.comboEngines.setCurrentIndex.assert_not_called()
+        console.PrintWarning.assert_called_once_with(
+            "PathSim: Saved engine 'removed_engine' is unavailable; using 'dexel_engine'.\n")
+
+    def test_selection_is_disabled_during_work(self):
+        self.panel.setSelectionEnabled(False)
+        for widget in (self.panel.form.comboJobs, self.panel.form.comboEngines,
+                       self.panel.form.listOperations):
+            widget.setEnabled.assert_called_once_with(False)
+
+    def test_hiding_stock_hides_mesh_and_skips_meshing(self):
+        self.panel.preferences = Mock()
+        self.panel.meshView = SimpleNamespace(ViewObject=SimpleNamespace(Visibility=True))
+        self.panel.sim.needsWork.return_value = False
+        self.panel.onStockVisibilityChanged(False)
+        self.assertFalse(self.panel.meshView.ViewObject.Visibility)
+        self.panel.sim.setShowStock.assert_called_once_with(False)
+        self.panel.preferences.SetBool.assert_called_once_with("ShowStock", False)
+        self.panel.startWorker.assert_not_called()
+
+    def test_showing_stock_while_paused_starts_worker_to_refresh_mesh(self):
+        self.panel.preferences = Mock()
+        self.panel.meshView = SimpleNamespace(ViewObject=SimpleNamespace(Visibility=False))
+        self.panel.sim.needsWork.return_value = True
+        self.panel.onStockVisibilityChanged(True)
+        self.assertTrue(self.panel.meshView.ViewObject.Visibility)
+        self.panel.sim.setShowStock.assert_called_once_with(True)
+        self.panel.startWorker.assert_called_once()
+
 
 class Document:
     def __init__(self):
@@ -157,6 +288,10 @@ class Document:
             addProperty=Mock())
         self.Objects.append(obj)
         return obj
+
+    def findObjects(self, type_id, pattern):
+        return [SimpleNamespace(Stock=SimpleNamespace(
+            Shape=SimpleNamespace(tessellate=lambda tolerance: ([], []))))]
 
     def removeObject(self, name):
         obj = next(obj for obj in self.Objects if obj.Name == name)
@@ -203,10 +338,12 @@ class SimulationObjectTests(unittest.TestCase):
         panel = self.open_panel()
         self.add_simulation_objects()
         panel.sim.initialised = False
-        panel.sim.engine.showInitialStock = False
         panel.getOperations = Mock(return_value=[object()])
         panel.updateTimeline = Mock()
-        self.assertTrue(panel.prepareSimulation())
+        panel.sim.showStock = False
+        with patch.object(gui.Mesh, "Mesh", lambda data: data, create=True):
+            self.assertTrue(panel.prepareSimulation())
+        self.assertFalse(panel.meshView.ViewObject.Visibility)
         self.assertEqual(self.document.Objects, [panel.meshView])
         self.assertEqual(panel.meshView.Name, "Simulation_Cutshape")
         self.assertEqual(panel.meshView.Label, "Simulation-Cutshape")

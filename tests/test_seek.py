@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from dexel import DexelGrid, RevolvedTool, TurningTool
 
@@ -47,6 +47,29 @@ def load_worker():
 
 
 worker = load_worker()
+
+
+class EngineLoadingTests(unittest.TestCase):
+    def test_selected_engine_loads_matching_module(self):
+        sim = worker.PathSim()
+        engine = object()
+        with patch.object(worker.importlib, "import_module",
+                          return_value=SimpleNamespace(Engine=lambda: engine)) as load:
+            self.assertTrue(sim.setupEngine("turning_profile_engine"))
+        load.assert_called_once_with("engines.turning_profile_engine")
+        self.assertIs(sim.engine, engine)
+
+    def test_missing_engine_reports_error_in_dialog(self):
+        sim = worker.PathSim()
+        dialog = Mock()
+        with patch.object(worker.importlib, "import_module",
+                          side_effect=ImportError("Missing test dependency")), \
+             patch.object(worker, "QtGui", SimpleNamespace(QMessageBox=lambda: dialog)), \
+             patch.object(worker.FreeCAD, "Console", SimpleNamespace(PrintError=Mock()), create=True):
+            self.assertFalse(sim.setupEngine("unavailable_engine"))
+        self.assertIn("Missing test dependency", dialog.setText.call_args.args[0])
+        self.assertEqual(sim.cleanup.calls, [()])
+        self.assertIsNone(sim.engine)
 
 
 class Clock:
@@ -137,6 +160,164 @@ class SeekTests(unittest.TestCase):
     def run_worker(self):
         with patch.object(worker, "time", self.clock):
             self.sim.runSimulation()
+
+    def test_distance_steps_cut_and_display_interpolated_positions(self):
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=0, z=0), self.operations[0])
+            for x in (0, 2, 2.4, 3.8)]
+        for expected in (1, 2, 3):
+            self.sim.stepForward()
+            self.run_worker()
+            self.assertAlmostEqual(self.sim.updatePos.calls[-1][0].Base.x, expected)
+            self.assertAlmostEqual(self.sim.engine.positions[-1], expected)
+            self.assertFalse(self.sim.running)
+        self.assertAlmostEqual(self.sim.engine.positions[-2], 2.4)
+        self.assertAlmostEqual(self.sim._cutFraction, 0.6 / 1.4)
+        self.sim.skipTo(0.25)
+        self.run_worker()
+        self.assertEqual(self.sim.engine.resets, 1)
+        self.assertEqual(self.sim.engine.positions, [0])
+        self.assertEqual(self.sim._cutFraction, 0)
+
+    def test_queued_steps_cross_short_segments_and_operation_changes(self):
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=0, z=0), self.operations[op])
+            for x, op in ((0, 0), (0, 0), (0.4, 0),
+                          (50, 1), (50.4, 1), (51.2, 1))]
+        self.sim.stepForward()
+        self.sim.stepForward()
+        self.run_worker()
+        self.assertAlmostEqual(self.sim.updatePos.calls[0][0].Base.x, 50.6)
+        self.assertAlmostEqual(self.sim.updatePos.calls[-1][0].Base.x, 51.2)
+        self.assertEqual(self.sim.idx, len(self.sim.pathPoints))
+        self.assertFalse(self.sim.needsWork())
+
+    def test_distance_step_follows_path_around_a_corner(self):
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=y, z=0), self.operations[0])
+            for x, y in ((0, 0), (0.6, 0), (0.6, 0.8))]
+        self.sim.stepForward()
+        self.run_worker()
+        position = self.sim.updatePos.calls[-1][0].Base
+        self.assertAlmostEqual(position.x, 0.6)
+        self.assertAlmostEqual(position.y, 0.4)
+
+    def test_distance_step_backward_reconstructs_to_interpolated_position(self):
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=0, z=0), self.operations[0])
+            for x in (0, 2, 4)]
+        self.sim.skipTo(1)
+        self.run_worker()
+        self.sim.stepBackward()
+        self.run_worker()
+        self.assertAlmostEqual(self.sim.updatePos.calls[-1][0].Base.x, 3)
+        self.assertEqual(self.sim.engine.positions, [0, 2, 3])
+        self.assertFalse(self.sim.running)
+
+    def test_distance_step_backward_skips_operation_repositioning(self):
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=0, z=0), self.operations[op])
+            for x, op in ((0, 0), (2, 0), (50, 1), (52, 1))]
+        self.sim.skipTo(1)
+        self.run_worker()
+        self.sim.stepBackward()
+        self.run_worker()
+        self.assertAlmostEqual(self.sim.updatePos.calls[-1][0].Base.x, 51)
+        self.sim.stepBackward()
+        self.run_worker()
+        self.assertAlmostEqual(self.sim.updatePos.calls[-1][0].Base.x, 50)
+        self.sim.stepBackward()
+        self.run_worker()
+        self.assertAlmostEqual(self.sim.updatePos.calls[-1][0].Base.x, 1)
+
+    def test_distance_step_backward_clamps_at_path_start(self):
+        self.sim.stepBackward()
+        self.run_worker()
+        self.assertEqual(self.sim.updatePos.calls[-1][0].Base.x, 0)
+        self.assertEqual(self.sim.idx, 1)
+
+    def test_backward_step_interrupts_playback_from_the_displayed_position(self):
+        self.configure_paced_turning()
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=0, z=0), self.operations[0]) for x in (0, 4, 8)]
+        self.sim.pathRapid = [False, False, False]
+        self.sim.turningCommandEnds = {1, 2, 3}
+        self.sim.engine.cutDuration = self.sim.engine.meshDuration = 0
+        origin = []
+
+        def step(placement):
+            if placement.Base.x >= 2:
+                origin.append(placement.Base.x)
+                self.sim.updatePos.callback = None
+                self.sim.stepBackward()
+
+        self.sim.updatePos.callback = step
+        self.sim.running = True
+        self.run_worker()
+        self.assertAlmostEqual(self.sim.updatePos.calls[-1][0].Base.x, origin[0] - 1)
+        self.assertFalse(self.sim.running)
+
+    def test_step_requested_during_reconstruction_runs_after_first_step(self):
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=0, z=0), self.operations[0]) for x in (0, 2, 4)]
+
+        def queue_another():
+            self.sim.engine.on_position = None
+            self.sim.stepForward()
+
+        self.sim.engine.on_position = queue_another
+        self.sim.stepForward()
+        self.run_worker()
+        self.assertAlmostEqual(self.sim.updatePos.calls[-1][0].Base.x, 2)
+        self.assertFalse(self.sim.needsWork())
+
+    def test_seeking_to_sample_before_partial_cut_reconstructs_stock(self):
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=0, z=0), self.operations[0]) for x in (0, 2, 4)]
+        self.sim.stepForward()
+        self.run_worker()
+        self.assertEqual(self.sim.idx, 1)
+        self.sim.skipTo(1 / 3)
+        self.run_worker()
+        self.assertEqual(self.sim.engine.resets, 1)
+        self.assertEqual(self.sim.engine.positions, [0])
+        self.assertEqual(self.sim.updatePos.calls[-1][0].Base.x, 0)
+
+    def test_playback_after_partial_step_cuts_remaining_path(self):
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=0, z=0), self.operations[0])
+            for x in (0, 2, 4)]
+        self.sim.stepForward()
+        self.run_worker()
+        self.assertEqual(self.sim.engine.positions, [0, 1])
+        self.sim.play()
+        self.run_worker()
+        self.assertEqual(self.sim.engine.positions, [0, 1, 2, 4])
+        self.assertEqual(self.sim.idx, 3)
+        self.assertEqual(self.sim._cutFraction, 0)
+
+    def test_step_interrupts_playback_from_the_displayed_position(self):
+        self.configure_paced_turning()
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=0, z=0), self.operations[0]) for x in (0, 4)]
+        self.sim.pathRapid = [False, False]
+        self.sim.turningCommandEnds = {1, 2}
+        self.sim.engine.cutDuration = self.sim.engine.meshDuration = 0
+        origin = []
+
+        def step(placement):
+            if placement.Base.x >= 0.5:
+                origin.append(placement.Base.x)
+                self.sim.updatePos.callback = None
+                self.sim.stepForward()
+
+        self.sim.updatePos.callback = step
+        self.sim.running = True
+        self.run_worker()
+        self.assertAlmostEqual(self.sim.updatePos.calls[-1][0].Base.x, origin[0] + 1)
+        self.assertAlmostEqual(self.sim.engine.positions[-1], origin[0] + 1)
+        self.assertFalse(self.sim.running)
+        self.assertEqual(self.sim.complete.calls, [])
 
     def test_forward_seek_only_displays_destination(self):
         self.sim.skipTo(0.8)
@@ -424,8 +605,8 @@ class SeekTests(unittest.TestCase):
 
         for turning in (False, True):
             results = []
-            for paced in (False, True):
-                with self.subTest(turning=turning, paced=paced):
+            for paced, stepped in ((False, False), (True, False), (False, True)):
+                with self.subTest(turning=turning, paced=paced, stepped=stepped):
                     self.setUp()
                     if turning:
                         self.operations[0].MinDiameter = 0
@@ -444,12 +625,22 @@ class SeekTests(unittest.TestCase):
                         "HorizRapid": 20, "VertRapid": 20}
                     self.sim._wake.wait = lambda seconds: setattr(
                         self.clock, "now", self.clock.now + seconds)
+                    if stepped:
+                        self.sim.stepForward()
+                        self.run_worker()
+                        expected = DexelGrid.cylinder(5, 10, 0.5)
+                        cut = expected.cut_turning if turning else expected.cut_segment
+                        a, b = ((6, 8), (5, 8)) if turning else ((6, 0, 8), (5, 0, 8))
+                        cut(self.sim.engine.tool, 1, a, a)
+                        cut(self.sim.engine.tool, 1, a, b)
+                        self.assertEqual(self.sim.engine.grid.extract(), expected.extract())
                     self.sim.running = True
                     self.run_worker()
                     results.append((self.sim.engine.grid.extract(),
                                     self.sim.engine.grid.volume(),
                                     self.sim.engine.positions))
             self.assertEqual(results[0], results[1])
+            self.assertEqual(results[0][:2], results[2][:2])
 
     def test_stop_during_paced_turning_flushes_only_the_current_position(self):
         self.configure_paced_turning()
@@ -573,6 +764,23 @@ class SeekTests(unittest.TestCase):
         self.sim.publishMesh()
         self.assertIs(self.sim.takeMesh()[0], mesh)
         self.assertEqual(self.sim.meshesPublished, 2)
+
+    def test_hidden_stock_cuts_without_meshing_and_refreshes_when_shown(self):
+        self.sim.showStock = False
+        self.sim.running = True
+        self.run_worker()
+        self.assertEqual(self.sim.engine.positions, list(range(20)))
+        self.assertEqual(self.sim.engine.meshes, [])
+        self.assertIsNone(self.sim.takeMesh())
+        toolLoads = len(self.sim.toolReady.calls)
+
+        self.sim.setShowStock(True)
+        self.assertTrue(self.sim.needsWork())
+        self.run_worker()
+        self.assertEqual(self.sim.engine.positions, list(range(20)))
+        self.assertEqual(self.sim.takeMesh()[0], tuple(range(20)))
+        self.assertEqual(len(self.sim.toolReady.calls), toolLoads)
+        self.assertFalse(self.sim.needsWork())
 
     def test_far_side_turning_matches_near_side_including_axis_crossing(self):
         profiles = (

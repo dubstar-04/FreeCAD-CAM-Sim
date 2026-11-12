@@ -75,6 +75,8 @@ class Engine:
 		self.faceOperationIds = []  # replaced for each mesh, never modified
 		self._mesh = None
 		self._meshDirty = True
+		self._surface = None
+		self._surfaceDirty = True
 		self.resolution = None  # model units; None chooses it from the stock size
 		self.targetColumns = 100000
 		self.toolTessellation = 0.1
@@ -93,6 +95,7 @@ class Engine:
 		self._cutTime = 0.0
 		self._columnsChanged = 0
 		self._meshUpdates = 0
+		self._surfaceUpdates = 0
 		self._extractTime = 0.0
 		self._meshTime = 0.0
 
@@ -130,6 +133,8 @@ class Engine:
 		self.faceOperationIds = []
 		self._mesh = None
 		self._meshDirty = True
+		self._surface = None
+		self._surfaceDirty = True
 		self._lastPosition = None
 		self._resetPerformance()
 		FreeCAD.Console.PrintMessage(
@@ -194,6 +199,7 @@ class Engine:
 				self.tool, self.operationId, self._lastPosition or position, position)
 		self._columnsChanged += changed
 		self._meshDirty = self._meshDirty or changed > 0
+		self._surfaceDirty = self._surfaceDirty or changed > 0
 		self._cutTime += time.perf_counter() - start
 		self._lastPosition = position
 		self._cuts += 1
@@ -201,19 +207,29 @@ class Engine:
 		if self._positions % 50 == 0:
 			self.reportPerformance()
 
+	def getSurface(self):
+		'''Return cached triangles and face owners, replacing them after a cut.'''
+		if self._surfaceDirty:
+			start = time.perf_counter()
+			triangles, owners = self.grid.extract()
+			self._extractTime += time.perf_counter() - start
+			self._surface = (triangles, owners)
+			self._surfaceDirty = False
+			self._triangles = len(triangles)
+			self._surfaceUpdates += 1
+		return self._surface
+
 	def getMesh(self):
 		'''Return a new mesh only when the material or its ownership has changed.'''
 		if not self._meshDirty:
 			return self._mesh
-		start = time.perf_counter()
-		triangles, faceOperationIds = self.grid.extract()
+		triangles, faceOperationIds = self.getSurface()
 		extracted = time.perf_counter()
 		mesh = Mesh.Mesh(triangles)
 		finished = time.perf_counter()
 		self._mesh = mesh
 		self.faceOperationIds = faceOperationIds
 		self._meshDirty = False
-		self._extractTime += extracted - start
 		self._meshTime += finished - extracted
 		self._meshUpdates += 1
 		self._triangles = len(triangles)
@@ -221,7 +237,7 @@ class Engine:
 
 	def reportPerformance(self):
 		''' report averages since the previous report, excluding playback delay '''
-		if not self._cuts and not self._meshUpdates:
+		if not self._cuts and not self._meshUpdates and not self._surfaceUpdates:
 			return
 
 		def average(total, count):
@@ -229,9 +245,9 @@ class Engine:
 
 		FreeCAD.Console.PrintMessage(
 			"[PathSim dexel] positions={} cuts={} cut_avg_ms={} columns_changed={} "
-			"mesh_updates={} triangles={} extract_avg_ms={} mesh_build_avg_ms={}\n".format(
+			"surface_updates={} mesh_updates={} triangles={} extract_avg_ms={} mesh_build_avg_ms={}\n".format(
 				self._positions, self._cuts, average(self._cutTime, self._cuts),
-				self._columnsChanged, self._meshUpdates, self._triangles,
-				average(self._extractTime, self._meshUpdates),
+				self._columnsChanged, self._surfaceUpdates, self._meshUpdates, self._triangles,
+				average(self._extractTime, self._surfaceUpdates),
 				average(self._meshTime, self._meshUpdates)))
 		self._resetWindow()
