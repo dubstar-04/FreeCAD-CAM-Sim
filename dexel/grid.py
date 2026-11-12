@@ -211,13 +211,6 @@ class DexelGrid:
         polygon = tool.sweep(start, end)
         rmin = min(x for x, _ in polygon)
         rmax = max(x for x, _ in polygon)
-        if rmin < -self.tolerance:
-            if rmax > self.tolerance:
-                raise ValueError("Turning insert sweeps across the spindle axis are not supported")
-            polygon = [(-x, z) for x, z in reversed(polygon)]
-            left = min(range(len(polygon)), key=lambda index: polygon[index])
-            polygon = polygon[left:] + polygon[:left]
-            rmin, rmax = -rmax, -rmin
         if (max(z for _, z in polygon) <= self.zmin + self.tolerance
                 or min(z for _, z in polygon) >= self.zmax - self.tolerance):
             return 0
@@ -235,9 +228,19 @@ class DexelGrid:
             self._radial_bounds = [
                 self._material_bounds(group) for group in self._radial_columns]
             self._radial_axis = axis
+        polygons = [polygon] if rmax >= 0 else []
+        if rmin < 0:
+            reflected = [(-x, z) for x, z in reversed(polygon)]
+            left = min(range(len(reflected)), key=lambda index: reflected[index])
+            polygons.append(reflected[left:] + reflected[:left])
+        # Revolution folds signed X onto radius. Keep both slices separate:
+        # their axial intervals can be disjoint at the same physical radius.
+        return sum(self._cut_turning_polygon(tool, tool_id, sweep) for sweep in polygons)
+
+    def _cut_turning_polygon(self, tool, tool_id, polygon):
         changed = 0
-        first = bisect_left(self._radial_radii, max(0, rmin))
-        last = bisect_right(self._radial_radii, rmax)
+        first = bisect_left(self._radial_radii, max(0, min(x for x, _ in polygon)))
+        last = bisect_right(self._radial_radii, max(x for x, _ in polygon))
         spans = tool.spans(polygon, self._radial_radii[first:last])
         for index, (bottom, top) in zip(range(first, last), spans):
             if top - bottom <= self.tolerance:

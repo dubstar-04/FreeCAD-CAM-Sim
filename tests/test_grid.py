@@ -5,6 +5,44 @@ from dexel import DexelGrid, RevolvedTool, TurningTool
 
 
 class MillingSegmentTests(unittest.TestCase):
+    def test_centreline_drill_removes_only_its_revolved_profile(self):
+        grid = DexelGrid.cylinder(6, 10, 0.5)
+        tool = TurningTool([(-4, 2), (0, 0), (4, 2), (4, 40), (-4, 40)])
+        self.assertEqual(grid.cut_turning(tool, 1, (0, 13), (0, 13)), 0)
+        self.assertGreater(grid.cut_turning(tool, 1, (0, 13), (0, 3)), 0)
+        for j in range(grid.ny):
+            for i in range(grid.nx):
+                radius = ((grid.xmin + (i + 0.5) * grid.dx) ** 2
+                          + (grid.ymin + (j + 0.5) * grid.dy) ** 2) ** 0.5
+                c = j * grid.nx + i
+                if radius < 4:
+                    self.assertAlmostEqual(grid.hi[c], 3 + radius / 2)
+                    self.assertEqual(grid.hi_id[c], 1)
+                elif radius < 6:
+                    self.assertEqual(grid.hi[c], 10)
+                    self.assertEqual(grid.hi_id[c], 0)
+
+    def test_turning_axis_crossing_preserves_separate_axial_intervals(self):
+        grid = DexelGrid.cylinder(4, 10, 0.5)
+        tool = TurningTool([(-3, 1), (-3, 2), (3, 8), (3, 7)])
+        self.assertGreater(grid.cut_turning(tool, 1, (0, 0), (0, 0)), 0)
+        for j in range(grid.ny):
+            for i in range(grid.nx):
+                radius = ((grid.xmin + (i + 0.5) * grid.dx) ** 2
+                          + (grid.ymin + (j + 0.5) * grid.dy) ** 2) ** 0.5
+                c = j * grid.nx + i
+                if 1 < radius < 3:
+                    intervals = grid.multi[c]
+                    self.assertEqual(len(intervals), 3)
+                    self.assertAlmostEqual(intervals[0][1], 4 - radius)
+                    self.assertAlmostEqual(intervals[1][0], 5 - radius)
+                    self.assertAlmostEqual(intervals[1][1], 4 + radius)
+                    self.assertAlmostEqual(intervals[2][0], 5 + radius)
+                elif 3 < radius < 4:
+                    self.assertEqual(grid.lo[c], 0)
+                    self.assertEqual(grid.hi[c], 10)
+        self.assertTrue(grid.multi)
+
     def test_vertical_move_reaches_exact_lowest_endpoint(self):
         for tool in (RevolvedTool.flat(1), RevolvedTool.ball(1)):
             for start_z, end_z in ((4, 2), (2, 4)):

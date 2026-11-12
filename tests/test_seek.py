@@ -295,7 +295,7 @@ class SeekTests(unittest.TestCase):
         self.assertEqual(self.sim.takeMesh()[0], tuple(range(18)))
         self.assertEqual({args[0] for args in self.sim.progress.calls}, {0.9})
 
-    def test_far_side_turning_matches_near_side_and_rejects_axis_crossing(self):
+    def test_far_side_turning_matches_near_side_including_axis_crossing(self):
         profiles = (
             [(0, 0), (2, 0), (2, 2), (0, 2)],
             [(0, 0), (2, 1), (1, 3)],
@@ -306,6 +306,8 @@ class SeekTests(unittest.TestCase):
             ((9, -12), (8, -8)),
             ((9, -12), (9, -12)),
             ((12, -10), (10, -10)),
+            ((-4, -12), (4, -8)),
+            ((0, -12), (0, -8)),
         )
         for profile in profiles:
             axis_moves = (((0, -12), (0, -8)), ((-0.00005, -12), (-0.00005, -8)))
@@ -324,11 +326,6 @@ class SeekTests(unittest.TestCase):
                         self.assertEqual(getattr(near, name), getattr(far, name))
                     self.assertEqual(near.extract(), far.extract())
                     self.assertEqual(far_tool.profile, original)
-
-        before = far.volume()
-        with self.assertRaisesRegex(ValueError, "across the spindle axis"):
-            far.cut_turning(far_tool, 2, (-4, -12), (4, -8))
-        self.assertEqual(far.volume(), before)
 
     def test_turning_seek_matches_original_geometry_and_face_colours(self):
         class TurningEngine(Engine):
