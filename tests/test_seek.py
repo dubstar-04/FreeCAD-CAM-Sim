@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from dexel import DexelGrid, TurningTool
+from dexel import DexelGrid, RevolvedTool, TurningTool
 
 
 class Signal:
@@ -34,7 +34,9 @@ class Placement:
 
 def load_worker():
     freecad = SimpleNamespace(
-        Placement=Placement, Vector=lambda *args: args, Rotation=lambda *args: None)
+        Placement=Placement,
+        Vector=lambda x=0, y=0, z=0: SimpleNamespace(x=x, y=y, z=z),
+        Rotation=lambda *args: None)
     qt = SimpleNamespace(QtCore=SimpleNamespace(QThread=object, Signal=Signal), QtGui=None)
     path = Path(__file__).resolve().parents[1] / "PathSim.py"
     spec = importlib.util.spec_from_file_location("seek_worker", path)
@@ -274,6 +276,180 @@ class SeekTests(unittest.TestCase):
         self.assertAlmostEqual(self.clock.now - 1, 2 * 39 / 20)
         self.assertEqual(self.sim.idx, 80)
         self.assertEqual(len(self.sim.complete.calls), 1)
+
+    def test_animation_interpolates_without_extra_cuts_or_future_stock(self):
+        self.configure_paced_turning()
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=0, z=0), self.operations[0]) for x in (0, 2)]
+        self.sim.pathRapid = [False, False]
+        self.sim.turningCommandEnds = {1, 2}
+        self.sim.operationSpeeds = lambda operation: {
+            "HorizFeed": 2 / 0.24, "VertFeed": 2 / 0.24,
+            "HorizRapid": 20, "VertRapid": 20}
+        self.sim.engine.cutDuration = self.sim.engine.meshDuration = 0
+        samples = []
+
+        def capture(placement):
+            samples.append((self.clock.now, placement.Base.x,
+                            list(self.sim.engine.positions)))
+
+        self.sim.updatePos.callback = capture
+        self.sim.running = True
+        self.run_worker()
+        intermediate = [(time, x, cuts) for time, x, cuts in samples if 0 < x < 2]
+        self.assertGreaterEqual(len(intermediate), 6)
+        self.assertTrue(all(cuts == [0] for _, _, cuts in intermediate))
+        self.assertTrue(all(b[1] > a[1] for a, b in zip(intermediate, intermediate[1:])))
+        self.assertAlmostEqual(self.clock.now - 1, 0.24)
+        self.assertEqual(self.sim.engine.positions, [0, 2])
+        self.assertEqual(self.sim.updatePos.calls[-1][0].Base.x, 2)
+
+    def test_pause_resume_preserves_partial_move_and_remaining_duration(self):
+        self.configure_paced_turning()
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=0, z=0), self.operations[0]) for x in (0, 2)]
+        self.sim.pathRapid = [False, False]
+        self.sim.turningCommandEnds = {1, 2}
+        self.sim.operationSpeeds = lambda operation: {
+            "HorizFeed": 2, "VertFeed": 2, "HorizRapid": 20, "VertRapid": 20}
+        self.sim.engine.cutDuration = self.sim.engine.meshDuration = 0
+
+        def pause(placement):
+            if placement.Base.x >= 0.5:
+                self.sim.updatePos.callback = None
+                self.sim.stop()
+
+        self.sim.updatePos.callback = pause
+        self.sim.running = True
+        self.run_worker()
+        paused = self.sim.updatePos.calls[-1][0].Base.x
+        self.assertGreaterEqual(paused, 0.5)
+        self.assertLess(paused, 2)
+        self.assertEqual(self.sim.idx, 1)
+        self.assertEqual(self.sim.engine.positions, [0])
+        self.assertAlmostEqual(self.sim.progress.calls[-1][0], (1 + paused / 2) / 2)
+        paused_at = self.clock.now
+        self.clock.now += 10
+        self.sim.running = True
+        self.run_worker()
+        self.assertAlmostEqual(self.clock.now - paused_at - 10, 1 - paused / 2)
+        self.assertEqual(self.sim.engine.positions, [0, 2])
+        self.assertEqual(self.sim.idx, 2)
+
+    def test_seek_to_last_completed_sample_discards_paused_interpolation(self):
+        self.configure_paced_turning()
+        self.sim.engine.cutDuration = self.sim.engine.meshDuration = 0
+
+        def pause(placement):
+            if placement.Base.x > 0.4:
+                self.sim.updatePos.callback = None
+                self.sim.stop()
+
+        self.sim.updatePos.callback = pause
+        self.sim.running = True
+        self.run_worker()
+        self.assertGreater(self.sim._motionFraction, 0)
+        self.assertEqual(self.sim.idx, 1)
+        self.sim.skipTo(1 / len(self.sim.pathPoints))
+        self.run_worker()
+        self.assertEqual(self.sim._motionFraction, 0)
+        self.assertEqual(self.sim.updatePos.calls[-1][0].Base.x, 0)
+        self.assertEqual(self.sim.engine.positions, [0])
+
+    def test_rapid_animation_uses_rapid_speed(self):
+        self.configure_paced_turning()
+        self.sim.pathPoints = [
+            (SimpleNamespace(x=x, y=0, z=0), self.operations[0]) for x in (0, 2)]
+        self.sim.pathRapid = [False, True]
+        self.sim.turningCommandEnds = {1, 2}
+        self.sim.operationSpeeds = lambda operation: {
+            "HorizFeed": 1, "VertFeed": 1, "HorizRapid": 10, "VertRapid": 10}
+        self.sim.engine.cutDuration = self.sim.engine.meshDuration = 0
+        self.sim.running = True
+        self.run_worker()
+        self.assertAlmostEqual(self.clock.now - 1, 0.2)
+        self.assertEqual(self.sim.engine.positions, [0, 2])
+
+    def test_seek_during_interpolation_discards_partial_move(self):
+        self.configure_paced_turning()
+        self.sim.engine.cutDuration = self.sim.engine.meshDuration = 0
+
+        def seek(placement):
+            if placement.Base.x > 0.4:
+                self.sim.updatePos.callback = None
+                self.sim.skipTo(0.1)
+
+        self.sim.updatePos.callback = seek
+        self.sim.running = True
+        self.run_worker()
+        self.assertEqual(self.sim.idx, 80)
+        self.assertEqual(self.sim.progress.calls[-1], (1.0,))
+        self.assertEqual(self.sim.engine.positions[-1], 79)
+        self.assertEqual(self.sim._motionFraction, 0)
+
+    def test_paced_animation_matches_unpaced_milling_and_turning_geometry(self):
+        class GridEngine(Engine):
+            supportsTurningSweeps = True
+
+            def __init__(self, clock, turning):
+                super().__init__(clock)
+                self.turning = turning
+                self.grid = DexelGrid.cylinder(5, 10, 0.5)
+                self.tool = (TurningTool([(0, 0), (1, 0), (1, 1), (0, 1)])
+                             if turning else RevolvedTool.flat(1, length=2))
+                self.previous = None
+
+            def setTurningTool(self, tool):
+                self.previous = None
+
+            def setTool(self, tool):
+                self.previous = None
+
+            def setOperation(self, operation_id):
+                self.operation_id = operation_id
+                self.previous = None
+
+            def processPosition(self, placement):
+                super().processPosition(placement)
+                p = placement.Base
+                position = (p.x, p.z) if self.turning else (p.x, p.y, p.z)
+                cut = self.grid.cut_turning if self.turning else self.grid.cut_segment
+                cut(self.tool, self.operation_id, self.previous or position, position)
+                self.previous = position
+
+            def getMesh(self):
+                super().getMesh()
+                mesh, self.faceOperationIds = self.grid.extract()
+                return mesh
+
+        for turning in (False, True):
+            results = []
+            for paced in (False, True):
+                with self.subTest(turning=turning, paced=paced):
+                    self.setUp()
+                    if turning:
+                        self.operations[0].MinDiameter = 0
+                        self.operations[0].MaxDiameter = 10
+                    self.sim.engine = GridEngine(self.clock, turning)
+                    self.sim.engine.cutDuration = self.sim.engine.meshDuration = 0
+                    self.sim.pathPoints = [
+                        (SimpleNamespace(x=x, y=0, z=z), self.operations[0])
+                        for x, z in ((6, 8), (4, 8), (3, 6), (3, 4))]
+                    self.sim.pathRapid = [True, True, False, False]
+                    self.sim.turningCommandEnds = {1, 2, 3, 4} if turning else set()
+                    self.sim.stepDelay = 0.05 if paced else 0
+                    self.sim.meshInterval = 1000
+                    self.sim.operationSpeeds = lambda operation: {
+                        "HorizFeed": 10, "VertFeed": 5,
+                        "HorizRapid": 20, "VertRapid": 20}
+                    self.sim._wake.wait = lambda seconds: setattr(
+                        self.clock, "now", self.clock.now + seconds)
+                    self.sim.running = True
+                    self.run_worker()
+                    results.append((self.sim.engine.grid.extract(),
+                                    self.sim.engine.grid.volume(),
+                                    self.sim.engine.positions))
+            self.assertEqual(results[0], results[1])
 
     def test_stop_during_paced_turning_flushes_only_the_current_position(self):
         self.configure_paced_turning()

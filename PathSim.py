@@ -92,6 +92,7 @@ class PathSim (QtCore.QThread):
 		self.pathRapid = []
 		self.turningCommandEnds = set()
 		self._pendingCut = None
+		self._motionFraction = 0.0
 		self.stepDistance = 2
 		# self.skippedDistance = 0
 		self.running = False
@@ -143,6 +144,7 @@ class PathSim (QtCore.QThread):
 	def reset(self):
 		self.initialised = False
 		self._pendingCut = None
+		self._motionFraction = 0.0
 		self.idx = 0
 		self._operation = None
 		self._toolShape = None
@@ -207,17 +209,18 @@ class PathSim (QtCore.QThread):
 		rot = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), 0)
 		meshPending = False
 		lastMesh = time.perf_counter()
-		lastDisplay = 0.0
+		self._lastDisplay = -math.inf
 		completed = False
-		playbackDeadline = time.perf_counter()
 
 		while True:
-			iterationStart = time.perf_counter()
 			with self._stateLock:
 				self._wake.clear()
 				target = self._seekTarget
 				seekSerial = self._seekSerial
 				playing = self.running
+
+			if target is not None:
+				self._motionFraction = 0.0
 
 			if target is not None and target < self.idx:
 				self._pendingCut = None
@@ -237,16 +240,11 @@ class PathSim (QtCore.QThread):
 					self._seekTarget = None
 				self.showCurrentPosition(rot)
 				lastMesh = time.perf_counter()
-				playbackDeadline = lastMesh
 				continue
 
 			if not playing and target is None:
 				break
 			if self.idx >= len(self.pathPoints):
-				remaining = playbackDeadline - time.perf_counter()
-				if target is None and playing and remaining > 0:
-					self._wake.wait(remaining)
-					continue
 				with self._stateLock:
 					if self._seekTarget is not None:
 						continue
@@ -259,7 +257,7 @@ class PathSim (QtCore.QThread):
 			operation = pntData[1]
 			if self._operation is not operation:
 				self.loadOperation(operation, notify=target is None)
-				lastDisplay = 0.0
+				self._lastDisplay = -math.inf
 
 			duration = 0.0
 			if target is None and self.stepDelay != 0 and self.idx > 0:
@@ -273,6 +271,12 @@ class PathSim (QtCore.QThread):
 						self._speeds[horizontal], self._speeds[vertical],
 						rapid=rapid, turning=isTurningOperation(operation))
 
+			if duration and not self.animateMove(previous, pos, duration, rot, seekSerial):
+				continue
+			with self._stateLock:
+				if self._seekSerial != seekSerial:
+					continue
+
 			placement = FreeCAD.Placement(pos, rot)
 			if (isTurningOperation(operation) and self.turningCommandEnds
 					and getattr(self.engine, "supportsTurningSweeps", False)):
@@ -282,6 +286,7 @@ class PathSim (QtCore.QThread):
 			else:
 				self.engine.processPosition(placement)
 			self.idx += 1
+			self._motionFraction = 0.0
 			meshPending = True
 
 			# Reconstruct all cuts without rendering the path to the seek target.
@@ -291,25 +296,12 @@ class PathSim (QtCore.QThread):
 				if self._seekSerial != seekSerial:
 					continue
 
-			if iterationStart - lastDisplay >= self.displayInterval:
-				lastDisplay = iterationStart
-				self.updateToolPosition(pos, rot)
-				self.progress.emit(self.idx / len(self.pathPoints))
-
-			if time.perf_counter() - lastMesh >= self.meshInterval:
+			meshDue = time.perf_counter() - lastMesh >= self.meshInterval
+			self.showPlaybackPosition(pos, rot, self.idx / len(self.pathPoints), force=meshDue)
+			if meshDue:
 				if self.publishMesh():
 					lastMesh = time.perf_counter()
 					meshPending = False
-
-			if target is None:
-				now = time.perf_counter()
-				# Limit catch-up to one display frame after slow cutting or meshing,
-				# otherwise deferred cuts race through whole passes between updates.
-				playbackDeadline = max(
-					playbackDeadline, now - self.displayInterval) + duration
-				remaining = playbackDeadline - now
-				if remaining >= self.displayInterval:
-					self._wake.wait(remaining)
 
 		if meshPending:
 			self.publishMesh()
@@ -324,6 +316,41 @@ class PathSim (QtCore.QThread):
 
 		if completed:
 			self.complete.emit()
+
+	def animateMove(self, start, end, duration, rot, seekSerial):
+		'''Display a paced move without cutting beyond the displayed position.'''
+		startTime = time.perf_counter() - self._motionFraction * duration
+		while True:
+			now = time.perf_counter()
+			self._motionFraction = min(1.0, max(0.0, (now - startTime) / duration))
+			with self._stateLock:
+				if not self.running or self._seekSerial != seekSerial:
+					return False
+				self._wake.clear()
+			if self._motionFraction >= 1.0:
+				return True
+			self.showPlaybackPosition(
+				self.interpolatedPosition(start, end), rot,
+				(self.idx + self._motionFraction) / len(self.pathPoints))
+			remaining = max(0.0, startTime + duration - time.perf_counter())
+			if remaining <= 1e-9:
+				self._motionFraction = 1.0
+				return True
+			self._wake.wait(min(self.displayInterval, remaining))
+
+	def showPlaybackPosition(self, pos, rot, progress, force=False):
+		now = time.perf_counter()
+		if force or now - self._lastDisplay >= self.displayInterval:
+			self._lastDisplay = now
+			self.updateToolPosition(pos, rot)
+			self.progress.emit(progress)
+
+	def interpolatedPosition(self, start, end):
+		fraction = self._motionFraction
+		return FreeCAD.Vector(
+			start.x + (end.x - start.x) * fraction,
+			start.y + (end.y - start.y) * fraction,
+			start.z + (end.z - start.z) * fraction)
 
 	def loadOperation(self, operation, notify=True):
 		if self._operation is operation:
@@ -378,13 +405,15 @@ class PathSim (QtCore.QThread):
 	def showCurrentPosition(self, rot):
 		if self.pathPoints:
 			pos, operation = self.pathPoints[max(0, self.idx - 1)]
+			if self._motionFraction and self.idx < len(self.pathPoints):
+				pos = self.interpolatedPosition(pos, self.pathPoints[self.idx][0])
 			if self._operation is operation:
 				self.changedOp.emit(operation)
 				self.toolReady.emit(self._toolShape)
 			else:
 				self.loadOperation(operation)
 			self.updateToolPosition(pos, rot)
-			self.progress.emit(self.idx / len(self.pathPoints))
+			self.progress.emit((self.idx + self._motionFraction) / len(self.pathPoints))
 		else:
 			self.progress.emit(0)
 
