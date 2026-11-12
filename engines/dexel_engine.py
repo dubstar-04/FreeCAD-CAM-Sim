@@ -66,12 +66,15 @@ class Engine:
 	'''
 
 	supportsTurningSweeps = True
+	meshStableWhenUnchanged = True
 
 	def __init__(self):
 		self.grid = None
 		self.tool = None
 		self.operationId = 0
 		self.faceOperationIds = []  # replaced for each mesh, never modified
+		self._mesh = None
+		self._meshDirty = True
 		self.resolution = None  # model units; None chooses it from the stock size
 		self.targetColumns = 100000
 		self.toolTessellation = 0.1
@@ -125,6 +128,8 @@ class Engine:
 		self.tool = None
 		self.operationId = 0
 		self.faceOperationIds = []
+		self._mesh = None
+		self._meshDirty = True
 		self._lastPosition = None
 		self._resetPerformance()
 		FreeCAD.Console.PrintMessage(
@@ -181,12 +186,14 @@ class Engine:
 			if abs(base.y) > 1e-7:
 				raise ValueError("Turning tool positions must be in the XZ plane")
 			position = (base.x, base.z)
-			self._columnsChanged += self.grid.cut_turning(
+			changed = self.grid.cut_turning(
 				self.tool, self.operationId, self._lastPosition or position, position,
 				axis=self._spindleAxis)
 		else:
-			self._columnsChanged += self.grid.cut_segment(
+			changed = self.grid.cut_segment(
 				self.tool, self.operationId, self._lastPosition or position, position)
+		self._columnsChanged += changed
+		self._meshDirty = self._meshDirty or changed > 0
 		self._cutTime += time.perf_counter() - start
 		self._lastPosition = position
 		self._cuts += 1
@@ -195,12 +202,17 @@ class Engine:
 			self.reportPerformance()
 
 	def getMesh(self):
-		''' return the cut shape as a freecad Mesh object'''
+		'''Return a new mesh only when the material or its ownership has changed.'''
+		if not self._meshDirty:
+			return self._mesh
 		start = time.perf_counter()
-		triangles, self.faceOperationIds = self.grid.extract()
+		triangles, faceOperationIds = self.grid.extract()
 		extracted = time.perf_counter()
 		mesh = Mesh.Mesh(triangles)
 		finished = time.perf_counter()
+		self._mesh = mesh
+		self.faceOperationIds = faceOperationIds
+		self._meshDirty = False
 		self._extractTime += extracted - start
 		self._meshTime += finished - extracted
 		self._meshUpdates += 1

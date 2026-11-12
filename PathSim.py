@@ -101,6 +101,7 @@ class PathSim (QtCore.QThread):
 		self._meshLock = threading.Lock()
 		self._latestMesh = None
 		self._meshSignalled = False
+		self._publishedMesh = None
 		self._stateLock = threading.Lock()
 		self._wake = threading.Event()
 		self._seekTarget = None
@@ -192,6 +193,7 @@ class PathSim (QtCore.QThread):
 			with self._meshLock:
 				self._latestMesh = None
 				self._meshSignalled = False
+				self._publishedMesh = None
 				self.meshesPublished = 0
 			job = FreeCAD.ActiveDocument.findObjects("Path::FeaturePython", "Job.*")[0]
 			self._stock = job.Stock.Shape.copy()
@@ -409,7 +411,9 @@ class PathSim (QtCore.QThread):
 		''' make the engine mesh available to the display, with the operation id of each face if
 		the engine tracks it. Only the newest mesh is kept, so a slow display skips meshes
 		instead of building up a backlog. Engines must replace faceOperationIds for each mesh,
-		not modify it, so the list is safe to hand to the gui thread.'''
+		not modify it, so the list is safe to hand to the gui thread. Engines that
+		set meshStableWhenUnchanged must return the same mesh and face ids until the
+		stock changes, and a new mesh when it changes.'''
 		with self._stateLock:
 			if seekSerial is None:
 				if self._seekTarget is not None:
@@ -424,7 +428,11 @@ class PathSim (QtCore.QThread):
 			if seekSerial != self._seekSerial:
 				return False
 			with self._meshLock:
+				if (getattr(self.engine, "meshStableWhenUnchanged", False)
+						and mesh is self._publishedMesh):
+					return True
 				self._latestMesh = frame
+				self._publishedMesh = mesh
 				self.meshesPublished += 1
 				notify = not self._meshSignalled
 				self._meshSignalled = True
@@ -448,6 +456,8 @@ class PathSim (QtCore.QThread):
 			self._seekTarget = int(max(0.0, min(1.0, progress)) * len(self.pathPoints))
 			self._seekSerial += 1
 			with self._meshLock:
+				if self._latestMesh is not None:
+					self._publishedMesh = None
 				self._latestMesh = None
 			self._wake.set()
 

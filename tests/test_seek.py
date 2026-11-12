@@ -88,6 +88,33 @@ class Engine:
         return self.meshes[-1]
 
 
+class CachedEngine(Engine):
+    meshStableWhenUnchanged = True
+
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.mesh = None
+        self.changed = False
+        self.faceOperationIds = []
+
+    def setStock(self, stock):
+        super().setStock(stock)
+        self.mesh = None
+        self.changed = False
+
+    def processPosition(self, placement):
+        super().processPosition(placement)
+        if placement.Base.x in (3, 7):
+            self.changed = True
+
+    def getMesh(self):
+        if self.mesh is None or self.changed:
+            self.mesh = super().getMesh()
+            self.faceOperationIds = [len(self.positions)]
+            self.changed = False
+        return self.mesh
+
+
 class SeekTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
@@ -294,6 +321,82 @@ class SeekTests(unittest.TestCase):
         self.assertEqual(self.sim.meshesPublished, 1)
         self.assertEqual(self.sim.takeMesh()[0], tuple(range(18)))
         self.assertEqual({args[0] for args in self.sim.progress.calls}, {0.9})
+
+    def test_unchanged_mesh_is_not_republished_after_delivery(self):
+        self.sim.engine = CachedEngine(self.clock)
+        self.assertTrue(self.sim.publishMesh())
+        first = self.sim.takeMesh()
+        self.assertTrue(self.sim.publishMesh())
+        self.assertIsNone(self.sim.takeMesh())
+        self.assertEqual(self.sim.meshesPublished, 1)
+        self.assertEqual(len(self.sim.engine.meshes), 1)
+        self.assertEqual(first[1], [0])
+
+    def test_seek_republishes_discarded_queued_mesh_without_rebuilding(self):
+        self.sim.engine = CachedEngine(self.clock)
+        self.assertTrue(self.sim.publishMesh())
+        self.sim.skipTo(0.1)
+        self.run_worker()
+        frame = self.sim.takeMesh()
+        self.assertEqual(frame, ((), [0]))
+        self.assertEqual(self.sim.meshesPublished, 2)
+        self.assertEqual(len(self.sim.engine.meshes), 1)
+
+    def test_seek_to_unchanged_delivered_stock_does_not_republish(self):
+        self.sim.engine = CachedEngine(self.clock)
+        self.sim.publishMesh()
+        self.sim.takeMesh()
+        self.sim.skipTo(0.1)
+        self.run_worker()
+        self.assertIsNone(self.sim.takeMesh())
+        self.assertEqual(self.sim.meshesPublished, 1)
+        self.assertEqual(len(self.sim.engine.meshes), 1)
+        self.assertEqual(self.sim.progress.calls[-1], (0.1,))
+
+    def test_superseded_cached_mesh_is_reused_when_seek_retargets(self):
+        self.sim.engine = CachedEngine(self.clock)
+
+        def retarget():
+            self.sim.engine.on_mesh = None
+            self.sim.skipTo(0.2)
+
+        self.sim.engine.on_mesh = retarget
+        self.sim.skipTo(0.2)
+        self.run_worker()
+        self.assertEqual(len(self.sim.engine.meshes), 1)
+        self.assertEqual(self.sim.meshesPublished, 1)
+        self.assertEqual(self.sim.takeMesh(), ((0, 1, 2, 3), [4]))
+
+    def test_pending_turning_cut_is_flushed_before_cache_check(self):
+        self.sim.engine = CachedEngine(self.clock)
+        self.sim.publishMesh()
+        self.sim.takeMesh()
+        self.sim._pendingCut = Placement(SimpleNamespace(x=3), None)
+        self.sim.publishMesh()
+        self.assertIsNone(self.sim._pendingCut)
+        self.assertEqual(self.sim.takeMesh(), ((3,), [1]))
+        self.assertEqual(len(self.sim.engine.meshes), 2)
+
+    def test_backward_seek_rebuilds_stock_even_when_no_cuts_change_it(self):
+        self.sim.engine = CachedEngine(self.clock)
+        self.sim.skipTo(0.1)
+        self.run_worker()
+        first = self.sim.takeMesh()
+        self.sim.skipTo(0)
+        self.run_worker()
+        self.assertEqual(self.sim.engine.resets, 1)
+        self.assertEqual(len(self.sim.engine.meshes), 2)
+        self.assertIsNot(self.sim.takeMesh()[0], first[0])
+
+    def test_legacy_engine_returning_same_object_is_still_published(self):
+        mesh = []
+        self.sim.engine.getMesh = lambda: mesh
+        self.sim.publishMesh()
+        self.sim.takeMesh()
+        mesh.append("changed")
+        self.sim.publishMesh()
+        self.assertIs(self.sim.takeMesh()[0], mesh)
+        self.assertEqual(self.sim.meshesPublished, 2)
 
     def test_far_side_turning_matches_near_side_including_axis_crossing(self):
         profiles = (
