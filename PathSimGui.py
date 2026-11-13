@@ -73,6 +73,9 @@ class PathSimPanel:
 		self.cleanup()
 
 		self.timeline = PathSimTimelineGui.timeline()
+		showStock = self.preferences.GetBool("ShowStock", True)
+		self.sim.showStock = showStock
+		self.timeline.setStockVisible(showStock)
 
 		# connect ui components
 		self.form.comboJobs.currentIndexChanged.connect(self.onJobChange)
@@ -91,6 +94,9 @@ class PathSimPanel:
 		self.timeline.playSignal.connect(self.simPlay)
 		self.timeline.stopSignal.connect(self.simStop)
 		self.timeline.skipRequested.connect(self.simSeek)
+		self.timeline.stepBackwardRequested.connect(self.simStepBackward)
+		self.timeline.stepForwardRequested.connect(self.simStepForward)
+		self.timeline.stockVisibilityChanged.connect(self.onStockVisibilityChanged)
 
 		self.setupUi()
 		self.form.comboEngines.currentTextChanged.connect(self.onEngineChange)
@@ -132,6 +138,15 @@ class PathSimPanel:
 				self.sim.reset()
 				self.timeline.setPlaying(False)
 				self.timeline.setProgress(0)
+
+	def onStockVisibilityChanged(self, visible):
+		''' hiding the stock shows only the tool motion and skips building stock meshes '''
+		self.preferences.SetBool("ShowStock", visible)
+		if self.meshView is not None:
+			self.meshView.ViewObject.Visibility = visible
+		self.sim.setShowStock(visible)
+		if visible and self.sim.needsWork() and not self.sim.isRunning():
+			self.startWorker()
 
 	def reject(self):
 		self.quit()
@@ -211,6 +226,22 @@ class PathSimPanel:
 		if not self.sim.isRunning():
 			self.startWorker()
 
+	def simStepForward(self):
+		if not self.sim.isRunning() and not self.prepareSimulation():
+			return
+		self.sim.stepForward()
+		self.timeline.setPlaying(False)
+		if not self.sim.isRunning():
+			self.startWorker()
+
+	def simStepBackward(self):
+		if not self.sim.isRunning() and not self.prepareSimulation():
+			return
+		self.sim.stepBackward()
+		self.timeline.setPlaying(False)
+		if not self.sim.isRunning():
+			self.startWorker()
+
 	def prepareSimulation(self):
 		if self.sim.initialised:
 			return True
@@ -226,13 +257,21 @@ class PathSimPanel:
 		self._resetMeshTiming()
 		if not self.sim.setupEngine(self.form.comboEngines.currentText()):
 			return False
+		if getattr(self.sim.engine, "turningOnly", False) is True:
+			unsupported = [op.Label for op in operations if not PathSim.isTurningOperation(op)]
+			if unsupported:
+				message = "The {} engine supports turning operations only: {}".format(
+					self.form.comboEngines.currentText(), ", ".join(unsupported))
+				FreeCAD.Console.PrintError("PathSim: {}\n".format(message))
+				QtGui.QMessageBox.warning(self.form, "Engine unavailable", message)
+				return False
 		self.meshView = self.document.addObject("Mesh::Feature", "Simulation_Cutshape")
 		self.meshView.Label = "Simulation-Cutshape"
 		self.meshView.addProperty("App::PropertyString", "PathSimObject", "PathSim")
 		self.meshView.PathSimObject = "Cutshape"
-		if getattr(self.sim.engine, "showInitialStock", True):
-			job = FreeCAD.ActiveDocument.findObjects("Path::FeaturePython", "Job.*")[0]
-			self.meshView.Mesh = Mesh.Mesh(job.Stock.Shape.tessellate(0.1))
+		job = FreeCAD.ActiveDocument.findObjects("Path::FeaturePython", "Job.*")[0]
+		self.meshView.Mesh = Mesh.Mesh(job.Stock.Shape.tessellate(0.1))
+		self.meshView.ViewObject.Visibility = self.sim.showStock
 
 		return True
 
@@ -310,6 +349,8 @@ class PathSimPanel:
 	def onMeshReady(self):
 		''' slot called when the simulation has a new mesh. Only the newest mesh is
 		displayed, meshes that arrive while the view is busy are skipped '''
+		if self._closing:
+			return
 		frame = self.sim.takeMesh()
 		if frame is not None:
 			self.updateMesh(*frame)
@@ -371,9 +412,9 @@ class PathSimPanel:
 
 		palette = [STOCK_COLOUR] + [
 			OPERATION_COLOURS[(operationId - 1) % len(OPERATION_COLOURS)]
-			for operationId in range(1, max(faceOperationIds, default=0) + 1)
+			for operationId in range(1, int(max(faceOperationIds, default=0)) + 1)
 		]
-		self.meshView.FaceColors = [palette[operationId] for operationId in faceOperationIds]
+		self.meshView.FaceColors = [palette[int(operationId)] for operationId in faceOperationIds]
 
 		# the mesh was replaced, so the view needs to apply the colours again
 		view = self.meshView.ViewObject
